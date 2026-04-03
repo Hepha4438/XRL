@@ -95,7 +95,7 @@ def main():
         verbose=1,
         tensorboard_log="./tb_doorkey_6x6/",
         seed=seed,
-        device="auto",
+        device="mps",
     )
 
     eval_callback = EvalCallback(
