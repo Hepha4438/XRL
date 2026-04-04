@@ -193,7 +193,9 @@ def main():
         save_obs_mode=args.save_obs_mode,
     )
 
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    dir_name = os.path.dirname(args.save_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     torch.save(data, args.save_path)
     print(f"\nSaved to {args.save_path}")
     print(f"  File size: {os.path.getsize(args.save_path) / 1e6:.1f} MB")
