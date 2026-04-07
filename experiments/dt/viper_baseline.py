@@ -1,0 +1,318 @@
+"""
+VIPER Baseline Implementation
+(Verifiable Reinforcement Learning via Policy Extraction)
+
+This script trains a Decision Tree to imitate a frozen PPO feature extractor.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+import joblib
+import numpy as np
+import torch
+import gymnasium as gym
+import minigrid
+import stable_baselines3
+from minigrid.wrappers import ImgObsWrapper
+from stable_baselines3 import PPO
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="VIPER Baseline for Policy Extraction")
+
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="stage1_outputs/collected_data.pt",
+        help="Path to the collected data containing features and actions from the CNN.",
+    )
+    parser.add_argument(
+        "--max_depth",
+        type=int,
+        default=None,
+        help="Maximum depth of the Decision Tree.",
+    )
+    parser.add_argument(
+        "--min_samples_leaf",
+        type=int,
+        default=1,
+        help="Minimum samples per leaf.",
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="experiments/dt/results/",
+        help="Directory to save outputs (model and metrics).",
+    )
+    parser.add_argument(
+        "--ppo_path",
+        type=str,
+        default="ppo_doorkey_6x6.zip",
+        help="Path to the trained PPO model for feature extraction.",
+    )
+    parser.add_argument(
+        "--env_name",
+        type=str,
+        default="MiniGrid-DoorKey-6x6-v0",
+        help="Gym environment name to evaluate on.",
+    )
+    parser.add_argument(
+        "--n_eval_episodes",
+        type=int,
+        default=100,
+        help="Number of episodes for game evaluation.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for environment evaluation.",
+    )
+
+    return parser.parse_args()
+
+
+def calculate_tree_metrics(clf: DecisionTreeClassifier) -> Dict[str, Any]:
+    """
+    Calculate interpretability metrics from the scikit-learn DecisionTree.
+
+    Args:
+        clf: A trained DecisionTreeClassifier.
+
+    Returns:
+        A dictionary containing tree metrics.
+    """
+    tree = clf.tree_
+    n_nodes = tree.node_count
+    children_left = tree.children_left
+    children_right = tree.children_right
+
+    # Rule Set Cardinality: The total number of leaf nodes in the tree
+    rule_set_cardinality = clf.get_n_leaves()
+
+    # Binarized # Concepts: The total number of internal (non-leaf) nodes in the tree
+    binarized_concepts = n_nodes - rule_set_cardinality
+
+    # Total Literals: Sum of the depths of all leaf nodes (via DFS)
+    total_literals = 0
+    stack = [(0, 0)]  # (node_id, depth)
+
+    while stack:
+        node_id, depth = stack.pop()
+
+        is_split_node = children_left[node_id] != -1
+        if is_split_node:
+            stack.append((children_left[node_id], depth + 1))
+            stack.append((children_right[node_id], depth + 1))
+        else:
+            # We reached a leaf node
+            total_literals += depth
+
+    metrics = {
+        "Rule Set Cardinality": int(rule_set_cardinality),
+        "Binarized Concepts": int(binarized_concepts),
+        "Total Literals": int(total_literals),
+        "Tree Depth": int(clf.get_depth()),
+    }
+
+    return metrics
+
+
+class DTAgent:
+    """Wrapper to interact with the environment using a frozen PPO feature extractor and a Decision Tree for actions."""
+    def __init__(self, dt_model: DecisionTreeClassifier, ppo_model: PPO, device: str = "cpu"):
+        self.dt_model = dt_model
+        self.ppo_model = ppo_model
+        self.device = device
+        
+    def predict(self, obs: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs).float().to(self.device)
+            # PPO CNN feature extractor
+            features = self.ppo_model.policy.features_extractor(obs_tensor)
+            
+        action = self.dt_model.predict(features.cpu().numpy())
+        return action
+
+
+def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) -> Dict[str, Any]:
+    """Evaluate the DecisionTreeClassifier directly in the Gym Environment."""
+    print(f"\nEvaluating DT policy on {args.n_eval_episodes} episodes of {args.env_name}...")
+    
+    try:
+        # Load the base model if there are no old NumPy compatibility errors
+        ppo_model = PPO.load(args.ppo_path, device="cpu")
+    except Exception as e:
+        print(f"Standard PPO load failed, retrying with custom feature extractors (error: {e})")
+        import torch.nn as nn
+        # Use fallback Custom Extractor to align with 5x5 / 6x6 variations loaded properly
+        class MinigridFeaturesExtractor(BaseFeaturesExtractor):
+            def __init__(self, observation_space: gym.Space, features_dim: int = 128):
+                super().__init__(observation_space, features_dim)
+                n_input_channels = observation_space.shape[0]
+                # Default 5x5 arch
+                self.cnn = nn.Sequential(
+                    nn.Conv2d(n_input_channels, 32, kernel_size=3, stride=1, padding=1),
+                    nn.ReLU(),
+                    nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+                    nn.ReLU(),
+                    nn.Flatten(),
+                )
+                # If 6x6, we add another layer (but we'll assume it defaults to whatever is standard or try to handle both if we can, but we use the basic architecture to get past `policy_kwargs` errors).
+                # To be safe, if env_name is 6x6, we redefine the architecture:
+                if '6x6' in args.env_name:
+                    self.cnn = nn.Sequential(
+                        nn.Conv2d(n_input_channels, 32, kernel_size=3, stride=1, padding=1),
+                        nn.ReLU(),
+                        nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+                        nn.ReLU(),
+                        nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+                        nn.ReLU(),
+                        nn.Flatten(),
+                    )
+                with torch.no_grad():
+                    sample = torch.as_tensor(observation_space.sample()[None]).float()
+                    n_flatten = self.cnn(sample).shape[1]
+                self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
+            def forward(self, observations: torch.Tensor) -> torch.Tensor:
+                return self.linear(self.cnn(observations.float()))
+        
+        custom_objects = {
+            "policy_kwargs": {
+                "features_extractor_class": MinigridFeaturesExtractor,
+                "features_extractor_kwargs": {"features_dim": 128},
+                "net_arch": {"pi": [128, 128], "vf": [128, 128]},
+            }
+        }
+        ppo_model = PPO.load(args.ppo_path, device="cpu", custom_objects=custom_objects)
+        
+    def _init():
+        env = gym.make(args.env_name)
+        return ImgObsWrapper(env)
+        
+    env = VecTransposeImage(DummyVecEnv([_init]))
+    env.seed(args.seed)
+    agent = DTAgent(dt_model, ppo_model, "cpu")
+    
+    successes = 0
+    returns = []
+    lengths = []
+    
+    for _ in range(args.n_eval_episodes):
+        obs = env.reset()
+        done = False
+        ep_return = 0.0
+        ep_len = 0
+        
+        while not done and ep_len < 1000:
+            # Predict expects the obs, we get an array from dummy vec env (shape 1, C, H, W)
+            action = agent.predict(obs)
+            obs, rewards, dones, infos = env.step(action)
+            ep_return += float(rewards[0])
+            ep_len += 1
+            done = bool(dones[0])
+            
+        info = infos[0] if isinstance(infos, (list, tuple)) and len(infos) > 0 else (infos[0] if infos else {})
+        is_success = bool(info.get("is_success", False)) or ep_return > 0
+        if is_success:
+            successes += 1
+            
+        returns.append(ep_return)
+        lengths.append(ep_len)
+        
+    env.close()
+    
+    return {
+        "Game Success Rate": successes / args.n_eval_episodes,
+        "Game Avg Return": float(np.mean(returns)),
+        "Game Avg Length": float(np.mean(lengths)),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+
+    # 1. Load data
+    print(f"Loading data from {args.data_path}...")
+    data = torch.load(args.data_path, map_location="cpu", weights_only=False)
+
+    if isinstance(data, dict):
+        if "features" in data and "actions" in data:
+            features = data["features"]
+            actions = data["actions"]
+        else:
+            raise KeyError("The .pt file is a dictionary but lacks 'features' or 'actions' keys.")
+    elif isinstance(data, tuple) and len(data) == 2:
+        features, actions = data
+    else:
+        raise ValueError("Unsupported data format in .pt file. Expected a dict or tuple.")
+
+    # Convert to numpy arrays with required types
+    features_np = features.numpy().astype(np.float32)
+    actions_np = actions.numpy().astype(np.int64)
+
+    print(f"Features shape: {features_np.shape}, Actions shape: {actions_np.shape}")
+
+    # 2. Preprocess
+    print("Splitting data into train/test sets...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        features_np, actions_np, test_size=0.20, random_state=42
+    )
+
+    # 3. Model Training
+    print("Training Decision Tree...")
+    clf = DecisionTreeClassifier(
+        max_depth=args.max_depth,
+        min_samples_leaf=args.min_samples_leaf,
+        random_state=42,
+    )
+    clf.fit(X_train, y_train)
+
+    # 4. Metrics Calculation
+    print("Calculating metrics...")
+    y_pred = clf.predict(X_test)
+    action_fidelity = accuracy_score(y_test, y_pred)
+
+    metrics = calculate_tree_metrics(clf)
+    metrics["Action Fidelity"] = float(action_fidelity)
+
+    # 4.5 Game Evaluation (Online rollout)
+    game_metrics = evaluate_on_env(clf, args)
+    metrics.update(game_metrics)
+
+    print("\n--- Metrics ---")
+    for key, val in metrics.items():
+        if isinstance(val, float):
+            print(f"{key}: {val:.4f}")
+        else:
+            print(f"{key}: {val}")
+    print("---------------\n")
+
+    # 5. Saving Artifacts
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = save_dir / "dt_policy.pkl"
+    print(f"Saving model to {model_path}...")
+    joblib.dump(clf, model_path)
+
+    metrics_path = save_dir / "metrics.json"
+    print(f"Saving metrics to {metrics_path}...")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=4)
+
+    print("Success! VIPER baseline execution completed.")
+
+
+if __name__ == "__main__":
+    main()
