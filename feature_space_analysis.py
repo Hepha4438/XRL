@@ -11,7 +11,7 @@ Outputs:
 
 Usage:
     python feature_space_analysis.py --features_path ./collected_data/features.pt
-    python feature_space_analysis.py --model_path ppo_doorkey_5x5.zip --env_name MiniGrid-DoorKey-5x5-v0
+    python feature_space_analysis.py --model_path ppo_doorkey_6x6.zip --env_name MiniGrid-DoorKey-6x6-v0
 """
 
 import argparse
@@ -33,7 +33,7 @@ from scipy.stats import kurtosis as scipy_kurtosis
 # 1a  SVD Analysis
 # ---------------------------------------------------------------------------
 
-def svd_analysis(X: np.ndarray, variance_threshold: float = 0.95):
+def svd_analysis(X: np.ndarray, variance_threshold: float = 0.99):
     N, d = X.shape
     mean = X.mean(axis=0)
     X_centered = X - mean
@@ -421,7 +421,7 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
                 obs_pixel_list.append(
                     np.zeros((7 * tile_size, 7 * tile_size, 3), dtype=np.uint8))
 
-            action, _ = model.predict(obs, deterministic=False)
+            action, _ = model.predict(obs, deterministic=True)
             obs_tensor = torch.as_tensor(obs).float().to(model.device)
             features = model.policy.features_extractor(obs_tensor)
             features_list.append(features.cpu())
@@ -452,7 +452,7 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
 # ---------------------------------------------------------------------------
 
 def run_stage1(features: torch.Tensor, actions: torch.Tensor,
-               variance_threshold: float = 0.95,
+               variance_threshold: float = 0.99,
                ica_n_runs: int = 5,
                seed: int = 42,
                save_dir: str = "./stage1_outputs"):
@@ -500,13 +500,13 @@ def main():
     parser = argparse.ArgumentParser(description="Stage 1: Feature Space Analysis")
     parser.add_argument("--features_path", type=str, default=None,
                         help="Path to pre-collected features .pt file (with 'features' and 'actions' keys)")
-    parser.add_argument("--model_path", type=str, default="ppo_doorkey_5x5.zip",
+    parser.add_argument("--model_path", type=str, default="ppo_doorkey_6x6.zip",
                         help="PPO model path (used if --features_path not given)")
-    parser.add_argument("--env_name", type=str, default="MiniGrid-DoorKey-5x5-v0",
+    parser.add_argument("--env_name", type=str, default="MiniGrid-DoorKey-6x6-v0",
                         help="Environment name (used if --features_path not given)")
     parser.add_argument("--n_episodes", type=int, default=800,
                         help="Number of episodes to collect")
-    parser.add_argument("--variance_threshold", type=float, default=0.95,
+    parser.add_argument("--variance_threshold", type=float, default=0.99,
                         help="Cumulative variance threshold for signal dim k")
     parser.add_argument("--ica_n_runs", type=int, default=5,
                         help="Number of ICA runs for stability check")

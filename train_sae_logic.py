@@ -827,7 +827,7 @@ def main(args):
         input_dim=features.shape[1],
         hidden_dim=args.hidden_dim,
         k=args.k,
-        n_actions=int(actions.max().item() + 1),
+        n_actions=len(action_names),
         n_clauses_per_action=args.n_clauses_per_action,
         sae_pretrain_epochs=args.sae_pretrain_epochs,
         n_epochs=args.n_epochs,

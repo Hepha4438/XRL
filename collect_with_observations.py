@@ -124,7 +124,7 @@ def collect_with_observations(
                 obs_pixel_list.append(pixel_obs)
 
             # --- Get features from PPO's feature extractor ---
-            action, _ = model.predict(obs, deterministic=False)
+            action, _ = model.predict(obs, deterministic=True)
             obs_tensor = torch.as_tensor(obs).float().to(model.device)
             features = model.policy.features_extractor(obs_tensor)
 
