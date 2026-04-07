@@ -8,14 +8,14 @@ Usage:
     # Rules agent only
     python check_success_rules.py \
         --model_path ./sae_logic_v3_outputs/sae_logic_v3_model.pt \
-        --ppo_path   ppo_doorkey_5x5.zip \
-        --env_name   MiniGrid-DoorKey-5x5-v0 \
+        --ppo_path   ppo_doorkey_6x6.zip \
+        --env_name   MiniGrid-DoorKey-6x6-v0 \
         --n_episodes 100
 
     # Rules agent + PPO baseline comparison
     python check_success_rules.py \
         --model_path ./sae_logic_v3_outputs/sae_logic_v3_model.pt \
-        --ppo_path   ppo_doorkey_5x5.zip \
+        --ppo_path   ppo_doorkey_6x6.zip \
         --compare_ppo
 """
 
@@ -362,10 +362,10 @@ def main():
                         default="./sae_logic_v3_outputs/sae_logic_v3_model.pt",
                         help="Path to trained SAELogicAgentV3 checkpoint")
     parser.add_argument("--ppo_path",    type=str,
-                        default="ppo_doorkey_5x5.zip",
+                        default="ppo_doorkey_6x6.zip",
                         help="Path to PPO model (for feature extraction and baseline)")
     parser.add_argument("--env_name",    type=str,
-                        default="MiniGrid-DoorKey-5x5-v0")
+                        default="MiniGrid-DoorKey-6x6-v0")
     parser.add_argument("--n_episodes",  type=int,  default=100)
     parser.add_argument("--max_steps",   type=int,  default=500,
                         help="Max steps per episode before forced termination")
@@ -381,7 +381,7 @@ def main():
 
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # Load rules agent
