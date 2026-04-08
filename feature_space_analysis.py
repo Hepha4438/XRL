@@ -377,6 +377,55 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
     from tqdm import tqdm
+    
+    # Register ALE (Atari) environments if needed
+    try:
+        import ale_py  # noqa: F401
+    except Exception:
+        pass
+    
+    # Simple frame stack wrapper for Atari
+    class FrameStack(gym.Wrapper):
+        def __init__(self, env, num_stack=4):
+            super().__init__(env)
+            self.num_stack = num_stack
+            self.frames = collections.deque(maxlen=num_stack)
+            # Update observation space for stacked frames
+            shape = env.observation_space.shape
+            if len(shape) == 3:  # HWC
+                self.observation_space = gym.spaces.Box(
+                    low=env.observation_space.low.min(),
+                    high=env.observation_space.high.max(),
+                    shape=(shape[0], shape[1], shape[2] * num_stack),
+                    dtype=env.observation_space.dtype
+                )
+            else:  # Already grayscale or other
+                self.observation_space = gym.spaces.Box(
+                    low=env.observation_space.low.min(),
+                    high=env.observation_space.high.max(),
+                    shape=(*shape, num_stack),
+                    dtype=env.observation_space.dtype
+                )
+        
+        def _get_obs(self):
+            assert len(self.frames) == self.num_stack
+            frames_list = list(self.frames)
+            # Stack along last axis
+            stacked = np.concatenate(frames_list, axis=-1)
+            return stacked
+        
+        def reset(self, **kwargs):
+            obs, info = self.env.reset(**kwargs)
+            for _ in range(self.num_stack):
+                self.frames.append(obs)
+            return self._get_obs(), info
+        
+        def step(self, action):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            self.frames.append(obs)
+            return self._get_obs(), reward, terminated, truncated, info
+    
+    import collections
 
     print(f"Loading PPO model from {model_path}...")
     model = PPO.load(model_path)
@@ -386,12 +435,21 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
     def make_env():
         def _init():
             env = gym.make(env_name, render_mode="rgb_array")
-            env = ImgObsWrapper(env)
+            # Apply environment-specific wrappers
+            if "MiniGrid" in env_name:
+                env = ImgObsWrapper(env)
+            elif "ALE/" in env_name:
+                # Atari preprocessing using SB3 utilities
+                from stable_baselines3.common.atari_wrappers import AtariWrapper
+                env = AtariWrapper(env, clip_reward=False)
+                # Add frame stacking (4 frames as expected by the model)
+                env = FrameStack(env, num_stack=4)
             raw_env_ref[0] = env
             return env
         return _init
 
     env = DummyVecEnv([make_env()])
+    # Apply VecTransposeImage for both MiniGrid and Atari (they output HWC format)
     env = VecTransposeImage(env)
 
     features_list = []
