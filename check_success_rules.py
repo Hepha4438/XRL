@@ -147,8 +147,9 @@ def load_rules_agent(model_path: str, ppo_path: str, device: str) -> RulesAgent:
 def make_vec_env(env_name: str, seed: int, render: bool = False):
     def _make():
         def _init():
-            e = gym.make(env_name, render_mode="human" if render else None)
-            return ImgObsWrapper(e)
+            from utils_env import make_env_by_name
+            rendered = "human" if render else None
+            return make_env_by_name(env_name, render_mode=rendered, seed=seed)
         return _init
 
     env = DummyVecEnv([_make()])

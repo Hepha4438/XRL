@@ -197,8 +197,11 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
         ppo_model = PPO.load(args.ppo_path, device="cpu", custom_objects=custom_objects)
         
     def _init():
-        env = gym.make(args.env_name)
-        return ImgObsWrapper(env)
+        import sys
+        import os
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+        from utils_env import make_env_by_name
+        return make_env_by_name(args.env_name, seed=args.seed)
         
     env = VecTransposeImage(DummyVecEnv([_init]))
     env.seed(args.seed)

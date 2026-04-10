@@ -116,16 +116,8 @@ def collect_with_observations(
 
     def make_env():
         def _init():
-            env = gym.make(env_name)
-            # Apply environment-specific wrappers
-            if "MiniGrid" in env_name:
-                env = ImgObsWrapper(env)
-            elif "ALE/" in env_name:
-                # Atari preprocessing using SB3 utilities
-                from stable_baselines3.common.atari_wrappers import AtariWrapper
-                env = AtariWrapper(env, clip_reward=False)
-                # Add frame stacking (4 frames as expected by the model)
-                env = FrameStack(env, num_stack=4)
+            from utils_env import make_env_by_name
+            env = make_env_by_name(env_name)
             raw_env_holder[0] = env
             return env
         return _init

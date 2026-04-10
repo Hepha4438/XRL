@@ -52,15 +52,19 @@ class MinigridFeaturesExtractor(BaseFeaturesExtractor):
         return self.linear(self.cnn(observations.float()))
 
 
-def make_vec_env(env_name: str):
+def make_vec_env(env_name: str, seed: int = 42):
     def _make():
         def _init():
             env = gym.make(env_name)
-            return ImgObsWrapper(env)
+            env = ImgObsWrapper(env)
+            env.reset(seed=seed)
+            env.action_space.seed(seed)
+            return env
 
         return _init
 
     env = DummyVecEnv([_make()])
+    env.seed(seed)
     return VecTransposeImage(env)
 
 
@@ -115,19 +119,24 @@ def parse_args():
     parser.add_argument("--env_name", type=str, default="MiniGrid-DoorKey-6x6-v0")
     parser.add_argument("--n_episodes", type=int, default=1000)
     parser.add_argument("--max_steps", type=int, default=100)
-    parser.add_argument("--deterministic", action="store_true", default=False)
+    parser.add_argument("--deterministic", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    # Set basic seeds for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     print(f"Loading model: {args.model_path}")
     model = load_model(args.model_path, device=args.device)
 
     print(f"Creating env: {args.env_name}")
-    env = make_vec_env(args.env_name)
+    env = make_vec_env(args.env_name, seed=args.seed)
 
     print(
         f"Evaluating {args.n_episodes} episodes "
@@ -150,7 +159,7 @@ def main():
     print("=" * 50)
     print(f"Success         : {successes}/{args.n_episodes} ({100.0 * successes / args.n_episodes:.2f}%)")
     print(f"Avg return      : {returns.mean():.4f} +/- {returns.std():.4f}")
-    print(f"Avg ep length   : {lengths.mean():.1f} +/- {lengths.std():.1f}")
+    print(f"Avg ep length   : {lengths.mean():.4f} +/- {lengths.std():.4f}")
 
 
 if __name__ == "__main__":

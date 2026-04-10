@@ -89,15 +89,22 @@ def plot_theorem2_visuals(results_path, output_dir):
     fidelity_coverage = np.mean(gamma > y_axis_2delta) * 100
     overall_agreement = np.mean(agreement) * 100
 
-    print(f"\n--- NeurIPS Report Metrics ---")
     print(f"Rigorous Fidelity Coverage (gamma > 2*Delta): {fidelity_coverage:.2f}%")
     print(f"Empirical Soft-Hard Agreement:            {overall_agreement:.2f}%")
     print(f"Binarization Cleanliness:                 {clean_frac:.2f}%")
     print(f"Binarization Ambiguity:                   {ambig_frac:.2f}%")
 
 if __name__ == "__main__":
+    import argparse
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    # Chú ý: verify_fidelity.py phải được chạy trước để tạo file này
-    RESULTS_FILE = os.path.join(base_dir, "results", "theorem2_analytics.pt")
-    OUTPUT_FOLDER = os.path.join(base_dir, "results", "figures")
-    plot_theorem2_visuals(RESULTS_FILE, OUTPUT_FOLDER)
+    
+    parser = argparse.ArgumentParser(description="Plot Theorem 2 Fidelity Results")
+    parser.add_argument("--results_file", type=str, 
+                        default=os.path.join(base_dir, "results", "theorem2_analytics.pt"),
+                        help="Path to the theorem2_analytics.pt file")
+    parser.add_argument("--output_folder", type=str, 
+                        default=os.path.join(base_dir, "results", "figures"),
+                        help="Directory to save the generated figures")
+    args = parser.parse_args()
+
+    plot_theorem2_visuals(args.results_file, args.output_folder)
