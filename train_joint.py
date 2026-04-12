@@ -1,27 +1,17 @@
 """
-SAE + Product T-Norm Neural Logic Training (V3 - Simplified)
+SAE + Product T-Norm Neural Logic Training (JOINT TRAINING BASELINE)
 =============================================================
-Key insight: The original V2 worked at epoch 30 (93.4% val acc) before the
-SAE drifted. The fix is dead simple:
-
-    1. Pre-train SAE alone (recon only) until it converges
-    2. FREEZE SAE completely  
-    3. Compute activation statistics from frozen SAE
-    4. Apply FIXED normalization (not learned) between SAE and bottleneck
-    5. Train bottleneck + logic on the frozen, normalized features
-
-No learnable scaler. No gradient wars. The logic layer sees a stable feature
-space from the start.
+This is an ablation study baseline demonstrating the "Gradient War" 
+phenomenon where the SAE and logic layer are trained simultaneously 
+from scratch.
 
 Usage:
-    python train_sae_logic_v3.py \
+    python train_joint.py \
         --features_path ./stage1_outputs/collected_data.pt \
-        --stage1_path ./stage1_outputs/stage1_outputs.pt \
         --hidden_dim 300 --k 50 \
         --n_clauses_per_action 10 \
-        --sae_pretrain_epochs 50 \
         --n_epochs 400 \
-        --save_dir ./sae_logic_v3_outputs
+        --save_dir ./sae_logic_joint_outputs
 """
 
 import argparse
@@ -180,23 +170,21 @@ class SAELogicConfig:
     n_clauses_per_action: int = 10
     l0_penalty_weight: float = 1e-4
 
-    # Loss weights (Stage 2 only — Stage 1 is pure recon)
     beta_action: float = 5.0
     lambda_bimodal: float = 0.0
     bimodal_max: float = 0.3
-    bimodal_warmup: int = 30  # epochs into Stage 2
+    bimodal_warmup: int = 30  # epochs into Logic training
     bimodal_ramp: int = 80
 
     action_class_weights: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
-    # Stage 1: SAE pre-training
-    sae_pretrain_epochs: int = 50
+    # SAE pre-training components, retained for joint loss
     sae_lr: float = 1e-3
     lambda_sparsity: float = 5e-3
-    alpha_recon: float = 1.0  # full weight during pretraining
+    alpha_recon: float = 1.0  
 
-    # Stage 2: Logic training
-    n_epochs: int = 400  # total epochs (stage 2 = n_epochs - sae_pretrain_epochs)
+    # Logic training
+    n_epochs: int = 400  # total epochs
     batch_size: int = 256
     logic_lr: float = 3e-3
     bottleneck_lr: float = 1e-3
@@ -205,7 +193,7 @@ class SAELogicConfig:
     seed: int = 42
     use_ica_init: bool = True
     log_every: int = 10
-    save_dir: str = "./sae_logic_v3_outputs"
+    save_dir: str = "./sae_logic_joint_outputs"
 
 
 # ============================================================================
@@ -213,16 +201,6 @@ class SAELogicConfig:
 # ============================================================================
 
 class SAELogicAgentV3(nn.Module):
-    """
-    Two-stage neuro-symbolic agent.
-    
-    Stage 1: SAE trained for reconstruction (frozen after convergence)
-    Stage 2: Fixed normalization → sigmoid bottleneck → product t-norm logic
-    
-    The key invariant: the logic layer ALWAYS sees features from the same
-    distribution. No moving targets.
-    """
-
     def __init__(self, config: SAELogicConfig, device: str = "cpu"):
         super().__init__()
         self.config = config
@@ -246,16 +224,11 @@ class SAELogicAgentV3(nn.Module):
             l0_penalty_weight=config.l0_penalty_weight,
         ).to(device)
 
-        # Input normalization (from Stage 1 data collection)
         self.register_buffer('feature_mean', torch.zeros(config.input_dim))
         self.register_buffer('feature_std', torch.ones(config.input_dim))
 
-        # SAE activation normalization (computed AFTER SAE pre-training)
-        # These are FIXED buffers, not learnable parameters
         self.register_buffer('z_mean', torch.zeros(config.hidden_dim))
         self.register_buffer('z_std', torch.ones(config.hidden_dim))
-
-        self._sae_frozen = False
 
     def set_normalization(self, mean: torch.Tensor, std: torch.Tensor):
         self.feature_mean.copy_(mean)
@@ -264,75 +237,14 @@ class SAELogicAgentV3(nn.Module):
     def normalize_input(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.feature_mean) / self.feature_std
 
-    def compute_z_normalization(self, loader: DataLoader):
-        """
-        Compute per-feature mean and std of SAE activations over the dataset.
-        
-        Only considers non-zero activations (since top-k makes most entries 0).
-        For features that are never active, std defaults to 1.0 (passthrough).
-        
-        Must be called AFTER SAE pretraining and BEFORE logic training.
-        """
-        print("\n  Computing SAE activation statistics...")
-        self.sae.eval()
-        
-        # Collect all activations
-        all_z = []
-        with torch.no_grad():
-            for batch_x, _ in loader:
-                batch_x = batch_x.to(self.device)
-                z_sparse, _ = self.sae.encode(batch_x)
-                all_z.append(z_sparse.cpu())
-        all_z = torch.cat(all_z, 0)  # (N, hidden_dim)
-
-        # Compute stats per feature, only from non-zero activations
-        z_mean = torch.zeros(self.config.hidden_dim)
-        z_std = torch.ones(self.config.hidden_dim)
-
-        for i in range(self.config.hidden_dim):
-            active = all_z[:, i]
-            active_nonzero = active[active > 0]
-            if len(active_nonzero) > 10:
-                z_mean[i] = active_nonzero.mean()
-                z_std[i] = active_nonzero.std().clamp(min=1e-3)
-            else:
-                # Inactive feature — normalize to 0
-                z_mean[i] = 0.0
-                z_std[i] = 1.0
-
-        self.z_mean.copy_(z_mean.to(self.z_mean.device))
-        self.z_std.copy_(z_std.to(self.z_std.device))
-        # Verify
-        z_normed = (all_z - z_mean) / z_std
-        # For active features, should be roughly centered
-        active_mask = all_z > 0
-        active_normed = z_normed[active_mask]
-        print(f"    Raw SAE activations: mean={all_z[active_mask].mean():.2f}, "
-              f"std={all_z[active_mask].std():.2f}, "
-              f"max={all_z.max():.2f}")
-        print(f"    Normalized activations (active only): mean={active_normed.mean():.2f}, "
-              f"std={active_normed.std():.2f}, "
-              f"range=[{active_normed.min():.2f}, {active_normed.max():.2f}]")
-        print(f"    Feature activity rate: {active_mask.float().mean():.3f}")
-
     def normalize_z(self, z: torch.Tensor) -> torch.Tensor:
-        """Fixed normalization of SAE activations."""
         return (z - self.z_mean) / self.z_std
-
-    def freeze_sae(self):
-        """Freeze SAE parameters."""
-        for param in self.sae.parameters():
-            param.requires_grad = False
-        self._sae_frozen = True
-        print("  SAE frozen.")
 
     def forward(self, x, normalize_input=False, return_features=False):
         if normalize_input:
             x = self.normalize_input(x)
 
         z_sparse, z_pre = self.sae.encode(x)
-
-        # Fixed normalization → sigmoid bottleneck
         z_normed = self.normalize_z(z_sparse)
         z_binary = self.bottleneck(z_normed)
 
@@ -357,89 +269,7 @@ class SAELogicAgentV3(nn.Module):
 
 
 # ============================================================================
-# Stage 1: SAE Pre-training
-# ============================================================================
-
-def pretrain_sae(
-    model: SAELogicAgentV3,
-    train_loader: DataLoader,
-    config: SAELogicConfig,
-    device: str,
-):
-    """Pre-train SAE for reconstruction only. No action loss, no logic."""
-    print("\n" + "=" * 70)
-    print("STAGE 1: SAE PRE-TRAINING (reconstruction only)")
-    print("=" * 70)
-
-    optimizer = torch.optim.Adam(model.sae.parameters(), lr=config.sae_lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.sae_pretrain_epochs, eta_min=1e-5
-    )
-
-    for epoch in range(config.sae_pretrain_epochs):
-        model.sae.train()
-        epoch_recon = []
-        epoch_sparsity = []
-
-        for batch_x, _ in train_loader:
-            batch_x = batch_x.to(device)
-
-            z_sparse, z_pre = model.sae.encode(batch_x)
-            x_recon = model.sae.decode(z_sparse)
-
-            recon_loss = F.mse_loss(x_recon, batch_x)
-            sparsity_loss = config.lambda_sparsity * z_pre.abs().mean()
-            loss = config.alpha_recon * recon_loss + sparsity_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-
-            with torch.no_grad():
-                model.sae._normalize_decoder()
-
-            optimizer.step()
-
-            epoch_recon.append(recon_loss.item())
-            epoch_sparsity.append(sparsity_loss.item())
-
-        scheduler.step()
-
-        if (epoch + 1) % config.log_every == 0:
-            mean_recon = np.mean(epoch_recon)
-            mean_sparse = np.mean(epoch_sparsity)
-
-            # Quick feature stats
-            with torch.no_grad():
-                batch_x, _ = next(iter(train_loader))
-                batch_x = batch_x.to(device)
-                z_sparse, _ = model.sae.encode(batch_x)
-                density = (z_sparse > 0).float().mean().item()
-                z_active_mean = z_sparse[z_sparse > 0].mean().item() if (z_sparse > 0).any() else 0
-
-            print(
-                f"  Epoch {epoch+1}/{config.sae_pretrain_epochs} | "
-                f"Recon: {mean_recon:.4f} | "
-                f"Sparsity: {mean_sparse:.4f} | "
-                f"Density: {density:.3f} | "
-                f"ActiveMean: {z_active_mean:.1f}"
-            )
-
-    # Final recon quality
-    model.sae.eval()
-    total_recon = 0
-    n_batches = 0
-    with torch.no_grad():
-        for batch_x, _ in train_loader:
-            batch_x = batch_x.to(device)
-            z_sparse, _ = model.sae.encode(batch_x)
-            x_recon = model.sae.decode(z_sparse)
-            total_recon += F.mse_loss(x_recon, batch_x).item()
-            n_batches += 1
-    print(f"\n  Final reconstruction MSE: {total_recon / n_batches:.4f}")
-
-
-# ============================================================================
-# Stage 2: Logic Training
+# Joint Training
 # ============================================================================
 
 def train_logic(
@@ -450,35 +280,20 @@ def train_logic(
     device: str,
 ):
     """
-    Train bottleneck + logic layer on frozen SAE features.
-    SAE is already frozen and z_normalization is already computed.
+    Train SAE, bottleneck, and logic layer jointly from scratch.
     """
     print("\n" + "=" * 70)
-    print("STAGE 2: LOGIC TRAINING (SAE frozen, fixed normalization)")
+    print("JOINT TRAINING (SAE + Logic)")
     print("=" * 70)
 
-    # Debug: show what the logic layer will see
-    with torch.no_grad():
-        batch_x, batch_a = next(iter(train_loader))
-        batch_x = batch_x.to(device)
-        z_sparse, _ = model.sae.encode(batch_x)
-        z_normed = model.normalize_z(z_sparse)
-        z_binary = model.bottleneck(z_normed)
-        print(f"\n  [Debug] Features entering logic layer:")
-        print(f"    SAE activations: mean={z_sparse.mean():.2f}, max={z_sparse.max():.2f}")
-        print(f"    After normalization: mean={z_normed.mean():.3f}, std={z_normed.std():.3f}, "
-              f"range=[{z_normed.min():.2f}, {z_normed.max():.2f}]")
-        print(f"    After bottleneck: mean={z_binary.mean():.3f}, "
-              f"near-binary={((z_binary < 0.05) | (z_binary > 0.95)).float().mean():.3f}")
-        print(f"    Feature density: {(z_sparse > 0).float().mean():.3f}\n")
-
-    # Only train bottleneck + logic
+    # Train all components
     optimizer = torch.optim.Adam([
+        {'params': model.sae.parameters(), 'lr': config.sae_lr},
         {'params': model.bottleneck.parameters(), 'lr': config.bottleneck_lr},
         {'params': model.logic_layer.parameters(), 'lr': config.logic_lr},
     ])
 
-    n_logic_epochs = config.n_epochs - config.sae_pretrain_epochs
+    n_logic_epochs = config.n_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=n_logic_epochs, eta_min=1e-5
     )
@@ -494,8 +309,9 @@ def train_logic(
     max_patience = 100
 
     for epoch_idx in range(n_logic_epochs):
-        epoch = epoch_idx + config.sae_pretrain_epochs  # global epoch number
+        epoch = epoch_idx  # global epoch number
 
+        model.sae.train()
         model.bottleneck.train()
         model.logic_layer.train()
         train_info = []
@@ -503,13 +319,18 @@ def train_logic(
         for batch_x, batch_a in train_loader:
             batch_x, batch_a = batch_x.to(device), batch_a.to(device)
 
-            # Forward through frozen SAE + fixed norm + trainable bottleneck + logic
             action_logits, features = model.forward(batch_x, return_features=True)
 
             # Action loss
             action_loss = F.cross_entropy(action_logits, batch_a, weight=class_weights)
 
-            # Bimodality loss (annealed from start of Stage 2)
+            # SAE losses
+            x_recon = features['x_recon']
+            z_pre = features['z_pre']
+            recon_loss = F.mse_loss(x_recon, batch_x)
+            sparsity_loss = config.lambda_sparsity * z_pre.abs().mean()
+
+            # Bimodality loss
             z_bin = features['z_binary']
             bimodal_raw = (z_bin * (1.0 - z_bin)).mean()
             if epoch_idx < config.bimodal_warmup:
@@ -523,6 +344,8 @@ def train_logic(
             logic_complexity = model.logic_layer.complexity_penalty()
 
             total_loss = (
+                config.alpha_recon * recon_loss +
+                sparsity_loss +
                 config.beta_action * action_loss +
                 bimodal_loss +
                 logic_complexity
@@ -531,16 +354,24 @@ def train_logic(
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(model.bottleneck.parameters()) + list(model.logic_layer.parameters()),
+                list(model.sae.parameters()) + 
+                list(model.bottleneck.parameters()) + 
+                list(model.logic_layer.parameters()),
                 config.max_grad_norm
             )
             optimizer.step()
+
+            # Normalize decoder dictionary weights
+            with torch.no_grad():
+                model.sae._normalize_decoder()
 
             acc = (action_logits.argmax(1) == batch_a).float().mean()
             near_binary = ((z_bin < 0.05) | (z_bin > 0.95)).float().mean()
 
             train_info.append({
                 'total_loss': total_loss.item(),
+                'recon_loss': recon_loss.item(),
+                'sparsity_loss': sparsity_loss.item(),
                 'action_loss': action_loss.item(),
                 'bimodal_loss': bimodal_loss.item(),
                 'bimodal_weight': bimodal_weight,
@@ -563,16 +394,15 @@ def train_logic(
         history.append(avg)
 
         if (epoch + 1) % config.log_every == 0:
-            lr_now = optimizer.param_groups[1]['lr']
+            lr_now = optimizer.param_groups[-1]['lr']
             print(
                 f"  Epoch {epoch+1}/{config.n_epochs} | "
                 f"Loss: {avg['total_loss']:.4f} | "
+                f"Recon: {avg['recon_loss']:.4f} | "
                 f"Act: {avg['action_loss']:.4f} | "
                 f"TrainAcc: {avg['accuracy']:.3f} | "
                 f"ValAcc: {val_acc:.3f} | "
                 f"NearBin: {avg['near_binary_frac']:.3f} | "
-                f"α: {avg['alpha_mean']:.1f} | "
-                f"BimW: {avg['bimodal_weight']:.2f} | "
                 f"LR: {lr_now:.1e}"
             )
 
@@ -586,10 +416,6 @@ def train_logic(
             patience = 0
         else:
             patience += 1
-
-        if patience >= max_patience and epoch_idx > 100:
-            print(f"\n  [Info] Early stopping at epoch {epoch} (no improvement for {max_patience} epochs)")
-            break
 
     return best_model_state, best_val_acc, history
 
@@ -643,7 +469,6 @@ def linear_probe(model, train_loader, val_loader, device, n_epochs=50, lr=1e-3):
     n_features = model.config.hidden_dim
     n_actions = model.config.n_actions
 
-    # Extract features
     def collect(loader):
         zs, acts = [], []
         with torch.no_grad():
@@ -682,10 +507,6 @@ def linear_probe(model, train_loader, val_loader, device, n_epochs=50, lr=1e-3):
 
     print(f"  Linear probe train acc: {tr_acc:.3f}")
     print(f"  Linear probe val acc:   {va_acc:.3f}")
-    if va_acc > 0.7:
-        print(f"  → Features have enough info. Logic layer is the bottleneck.")
-    else:
-        print(f"  → Features lost info. SAE/bottleneck needs work.")
     return tr_acc, va_acc
 
 
@@ -703,12 +524,12 @@ def plot_training_history(history, save_dir):
     epochs = [h['epoch'] for h in history]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("SAE + Product T-Norm Logic Training (V3)", fontsize=14, fontweight="bold")
+    fig.suptitle("SAE + Product T-Norm Logic Training (JOINT)", fontsize=14, fontweight="bold")
 
     ax = axes[0, 0]
-    ax.plot(epochs, [h['total_loss'] for h in history], label='Total', linewidth=2)
-    ax.plot(epochs, [h['action_loss'] for h in history], label='Action', alpha=0.7)
-    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss'); ax.set_title('Loss Components')
+    ax.plot(epochs, [h['recon_loss'] for h in history], label='Recon', linewidth=2)
+    ax.plot(epochs, [h['sparsity_loss'] for h in history], label='Sparsity', alpha=0.7)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('SAE Loss'); ax.set_title('SAE Metrics')
     ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
@@ -741,7 +562,7 @@ def plot_training_history(history, save_dir):
     ax.legend(); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "training_curves.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(os.path.join(save_dir, "training_curves_joint.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -784,43 +605,28 @@ def main(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
-    # Save training data for visualization (if requested)
     if getattr(args, 'save_training_data', False):
         training_data_path = os.path.join(args.save_dir, "training_data.pt")
-        # Load observations if they exist in the source data
         source_data = torch.load(args.features_path, weights_only=False)
         obs = source_data.get('observations', source_data.get('obs', None))
 
         save_dict = {
-            'features': features,           # NORMALIZED features (what the SAE sees)
+            'features': features,
             'actions': actions,
-            'shuffle_indices': idx,          # permutation used for train/val split
+            'shuffle_indices': idx,
             'n_train': n_train,
             'feature_mean': feat_mean,
             'feature_std': feat_std,
-            'pre_normalized': True,          # flag: these are already normalized
+            'pre_normalized': True,
         }
         if obs is not None:
             if isinstance(obs, torch.Tensor):
                 save_dict['observations'] = obs
             else:
                 save_dict['observations'] = torch.tensor(obs)
-            print(f"  Including observations: {save_dict['observations'].shape}")
-
         torch.save(save_dict, training_data_path)
-        print(f"  Saved training data to {training_data_path}")
-        print(f"    features: {features.shape} (pre-normalized)")
-        print(f"    shuffle_indices: {idx.shape}")
-        print(f"    pre_normalized: True")
- 
-
 
     action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
-    print(f"  Train: {len(train_ds)}, Val: {len(val_ds)}, Actions: {actions.max()+1}")
-    print(f"\n  Class distribution:")
-    for i, name in enumerate(action_names):
-        c = (actions == i).sum().item()
-        print(f"    {name}: {c} ({100*c/len(actions):.1f}%)")
 
     # --- Config ---
     config = SAELogicConfig(
@@ -829,12 +635,10 @@ def main(args):
         k=args.k,
         n_actions=len(action_names),
         n_clauses_per_action=args.n_clauses_per_action,
-        sae_pretrain_epochs=args.sae_pretrain_epochs,
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,
         save_dir=args.save_dir,
         seed=args.seed,
-        use_ica_init=args.use_ica_init,
         bimodal_max=args.bimodal_max,
         bimodal_warmup=args.bimodal_warmup,
         bimodal_ramp=args.bimodal_ramp,
@@ -866,24 +670,12 @@ def main(args):
 
     print(f"\nArchitecture: {config.input_dim} → SAE({config.hidden_dim}, k={config.k}) → "
           f"FixedNorm → Sigmoid → Logic({config.n_clauses_per_action} clauses/action) → {config.n_actions}")
-    print(f"  SAE pretrain: {config.sae_pretrain_epochs} epochs")
-    print(f"  Logic train: {config.n_epochs - config.sae_pretrain_epochs} epochs")
-    print(f"  Bimodality: warmup={config.bimodal_warmup}, ramp={config.bimodal_ramp}, max={config.bimodal_max}")
+    print(f"  Joint train: {config.n_epochs} epochs")
 
-    # ============================
-    # STAGE 1: Pre-train SAE
-    # ============================
-    pretrain_sae(model, train_loader, config, device)
-
-    # ============================
-    # FREEZE SAE + COMPUTE NORMALIZATION
-    # ============================
-    model.freeze_sae()
-    model.compute_z_normalization(train_loader)
     model.to(device)
 
     # ============================
-    # STAGE 2: Train logic
+    # JOINT TRAINING
     # ============================
     best_state, best_acc, history = train_logic(
         model, train_loader, val_loader, config, device
@@ -899,46 +691,14 @@ def main(args):
         best_state = {'model': model.state_dict(), 'epoch': config.n_epochs-1, 'val_acc': best_acc}
 
     # --- Analysis ---
-    print(f"\n{'='*70}")
-    print("PER-CLASS ACCURACY (val)")
-    print(f"{'='*70}")
     per_class_accuracy(model, val_loader, device, action_names)
-
     linear_probe(model, train_loader, val_loader, device)
 
     # --- Rules ---
-    print(f"\n{'='*70}")
-    print("LEARNED RULES (DNF)")
-    print(f"{'='*70}")
     rules = model.extract_rules(action_names=action_names)
-    for aname, clauses in rules.items():
-        print(f"\n{aname} ←")
-        for i, c in enumerate(dict.fromkeys(clauses)):
-            print(f"    {c}")
-            if i < len(set(clauses)) - 1:
-                print("  ∨")
-
-    # --- Binarization ---
-    print(f"\n{'='*70}")
-    print("BINARIZATION QUALITY")
-    print(f"{'='*70}")
-    model.eval()
-    with torch.no_grad():
-        all_z = []
-        for bx, _ in val_loader:
-            bx = bx.to(device)
-            zs, _ = model.sae.encode(bx)
-            zn = model.normalize_z(zs)
-            zb = model.bottleneck(zn)
-            all_z.append(zb.cpu())
-        all_z = torch.cat(all_z, 0)
-        print(f"  Near {{0,1}} (±0.05): {((all_z < 0.05) | (all_z > 0.95)).float().mean():.3f}")
-        print(f"  Near 0.5 (±0.1):    {((all_z > 0.4) & (all_z < 0.6)).float().mean():.3f}")
-        print(f"  Mean: {all_z.mean():.4f}")
-        print(f"  Sharpness α: {model.bottleneck.get_sharpness().mean():.1f}")
-
+    
     # --- Save ---
-    save_path = os.path.join(args.save_dir, "sae_logic_v3_model.pt")
+    save_path = os.path.join(args.save_dir, "sae_logic_joint_model.pt")
     torch.save({
         'model_state': best_state['model'],
         'config': asdict(config),
@@ -955,21 +715,11 @@ def main(args):
 
     plot_training_history(history, args.save_dir)
 
-    stats = model.logic_layer.count_active_rules(action_names=action_names)
-    print(f"\n{'='*70}")
-    print("RULE STATISTICS")
-    print(f"{'='*70}")
-    print(f"  Total clauses: {stats['total_clauses']}")
-    print(f"  Non-empty: {stats['non_empty_clauses']}")
-    print(f"  Avg literals/clause: {stats['avg_literals_per_clause']:.2f}")
-    for a, c in stats['clauses_per_action'].items():
-        print(f"    {a}: {c}")
-
     print(f"\n  Saved: {save_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SAE + Product T-Norm Logic V3")
+    parser = argparse.ArgumentParser(description="SAE + Product T-Norm Logic JOINT")
 
     parser.add_argument("--features_path", type=str, required=True)
     parser.add_argument("--stage1_path", type=str, default=None)
@@ -978,7 +728,6 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=50)
     parser.add_argument("--n_clauses_per_action", type=int, default=10)
 
-    parser.add_argument("--sae_pretrain_epochs", type=int, default=50)
     parser.add_argument("--n_epochs", type=int, default=400)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
@@ -996,16 +745,12 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_sparsity", type=float, default=5e-3)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
 
-    parser.add_argument("--save_dir", type=str, default="./sae_logic_v3_outputs")
+    parser.add_argument("--save_dir", type=str, default="./sae_logic_joint_outputs")
     parser.add_argument(
         "--action_class_weights", type=float, nargs=7,
         default=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     )
     parser.add_argument("--save_training_data", action="store_true",
                     help="Save normalized features + observations for visualization")
-    parser.add_argument("--use_ica_init", action="store_true", default=True,
-                    help="Use ICA initialization for SAE (default: True)")
-    parser.add_argument("--no_ica_init", action="store_false", dest="use_ica_init",
-                    help="Disable ICA initialization")
     args = parser.parse_args()
     main(args)
