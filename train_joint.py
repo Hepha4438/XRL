@@ -639,6 +639,7 @@ def main(args):
         batch_size=args.batch_size,
         save_dir=args.save_dir,
         seed=args.seed,
+        use_ica_init=args.use_ica_init,
         bimodal_max=args.bimodal_max,
         bimodal_warmup=args.bimodal_warmup,
         bimodal_ramp=args.bimodal_ramp,
@@ -752,5 +753,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--save_training_data", action="store_true",
                     help="Save normalized features + observations for visualization")
+    parser.add_argument("--use_ica_init", action="store_true", default=True,
+                    help="Use ICA initialization for SAE (default: True)")
+    parser.add_argument("--no_ica_init", action="store_false", dest="use_ica_init",
+                    help="Disable ICA initialization")
     args = parser.parse_args()
     main(args)
