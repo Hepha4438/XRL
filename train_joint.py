@@ -261,10 +261,11 @@ class SAELogicAgentV3(nn.Module):
             }
         return action_logits
 
-    def extract_rules(self, concept_labels=None, action_names=None):
+    def extract_rules(self, concept_labels=None, action_names=None, threshold=0.3):
         return self.logic_layer.extract_rules(
             feature_names=concept_labels,
             action_names=action_names,
+            threshold=threshold
         )
 
 
@@ -696,7 +697,7 @@ def main(args):
     linear_probe(model, train_loader, val_loader, device)
 
     # --- Rules ---
-    rules = model.extract_rules(action_names=action_names)
+    rules = model.extract_rules(action_names=action_names, threshold=args.threshold)
     
     # --- Save ---
     save_path = os.path.join(args.save_dir, "sae_logic_joint_model.pt")
@@ -745,6 +746,11 @@ if __name__ == "__main__":
     parser.add_argument("--l0_penalty", type=float, default=1e-4)
     parser.add_argument("--lambda_sparsity", type=float, default=5e-3)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
+    
+    # [MỚI] Nhận tham số Temperature từ Terminal
+    parser.add_argument("--tau_start", type=float, default=1.0)
+    parser.add_argument("--tau_end", type=float, default=0.1)
+    parser.add_argument("--tau_anneal_epochs", type=int, default=200)
 
     parser.add_argument("--save_dir", type=str, default="./sae_logic_joint_outputs")
     parser.add_argument(
@@ -757,5 +763,7 @@ if __name__ == "__main__":
                     help="Use ICA initialization for SAE (default: True)")
     parser.add_argument("--no_ica_init", action="store_false", dest="use_ica_init",
                     help="Disable ICA initialization")
+    parser.add_argument("--threshold", type=float, default=0.3,
+                    help="Threshold for rule extraction")
     args = parser.parse_args()
     main(args)
