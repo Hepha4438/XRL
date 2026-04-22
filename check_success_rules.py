@@ -87,7 +87,7 @@ class RulesAgent:
 
     def print_rules(self):
         """Print the learned rules being used."""
-        rules = self.logic_model.extract_rules(action_names=ACTION_NAMES)
+        rules = self.logic_model.extract_rules(action_names=ACTION_NAMES, threshold=0.5)
         print("\n" + "=" * 60)
         print("ACTIVE LOGIC RULES")
         print("=" * 60)

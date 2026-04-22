@@ -27,7 +27,7 @@ def calculate_lucid_complexity(agent):
     """
     Compute complexity metrics based on the rules extracted from the logic agent.
     """
-    rules = agent.logic_model.extract_rules(action_names=ACTION_NAMES)
+    rules = agent.logic_model.extract_rules(action_names=ACTION_NAMES, threshold=0.5)
     
     conjunctive_rule_count = 0
     total_literals = 0

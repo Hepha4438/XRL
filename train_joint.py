@@ -11,7 +11,8 @@ Usage:
         --hidden_dim 300 --k 50 \
         --n_clauses_per_action 10 \
         --n_epochs 400 \
-        --save_dir ./sae_logic_joint_outputs
+        --save_dir ./sae_logic_joint_outputs \
+        --entropy_weight 0.05
 """
 
 import argparse
@@ -103,6 +104,18 @@ class ProductTNormLogicLayer(nn.Module):
         p, n = self._get_selection_probs()
         return self.l0_penalty_weight * (p + n).mean()
 
+    def entropy_penalty(self) -> torch.Tensor:
+        """
+        [MỚI] Ép cụm (p, n, absent) về dạng one-hot 
+        (chỉ 1 giá trị xấp xỉ 1, các giá trị còn lại xấp xỉ 0)
+        """
+        p, n = self._get_selection_probs()
+        a = 1.0 - p - n # Xác suất bỏ qua (absent)
+        
+        # Thêm 1e-8 để tránh lỗi log(0)
+        entropy = - (p * torch.log(p + 1e-8) + n * torch.log(n + 1e-8) + a * torch.log(a + 1e-8))
+        return entropy.sum()
+
     def extract_rules(self, feature_names=None, action_names=None, threshold=0.3):
         if feature_names is None:
             feature_names = [f"f_{i}" for i in range(self.n_features)]
@@ -175,6 +188,9 @@ class SAELogicConfig:
     bimodal_max: float = 0.3
     bimodal_warmup: int = 30  # epochs into Logic training
     bimodal_ramp: int = 80
+    
+    # [MỚI] Trọng số mục tiêu cho hàm Entropy (Sẽ scale dần từ 0 lên entropy_weight)
+    entropy_weight: float = 0.005
 
     action_class_weights: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
@@ -273,153 +289,106 @@ class SAELogicAgentV3(nn.Module):
 # Joint Training
 # ============================================================================
 
-def train_logic(
-    model: SAELogicAgentV3,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    config: SAELogicConfig,
-    device: str,
-):
-    """
-    Train SAE, bottleneck, and logic layer jointly from scratch.
-    """
+def train_logic(model, train_loader, val_loader, config, device):
     print("\n" + "=" * 70)
-    print("JOINT TRAINING (SAE + Logic)")
+    print("JOINT TRAINING (SAE + Logic) WITH ENTROPY PENALTY (LINEAR RAMP-UP)")
     print("=" * 70)
 
-    # Train all components
     optimizer = torch.optim.Adam([
         {'params': model.sae.parameters(), 'lr': config.sae_lr},
         {'params': model.bottleneck.parameters(), 'lr': config.bottleneck_lr},
         {'params': model.logic_layer.parameters(), 'lr': config.logic_lr},
     ])
-
-    n_logic_epochs = config.n_epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_logic_epochs, eta_min=1e-5
-    )
-
-    class_weights = torch.tensor(
-        config.action_class_weights, dtype=torch.float32, device=device
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.n_epochs, eta_min=1e-5)
+    class_weights = torch.tensor(config.action_class_weights, dtype=torch.float32, device=device)
 
     best_val_acc = 0.0
+    best_loss = float('inf')  # Dùng để tie-break khi Accuracy bằng nhau
     best_model_state = None
     history = []
-    patience = 0
-    max_patience = 100
 
-    for epoch_idx in range(n_logic_epochs):
-        epoch = epoch_idx  # global epoch number
-
-        model.sae.train()
-        model.bottleneck.train()
-        model.logic_layer.train()
+    for epoch_idx in range(config.n_epochs):
+        model.train()
         train_info = []
 
         for batch_x, batch_a in train_loader:
             batch_x, batch_a = batch_x.to(device), batch_a.to(device)
-
             action_logits, features = model.forward(batch_x, return_features=True)
 
-            # Action loss
             action_loss = F.cross_entropy(action_logits, batch_a, weight=class_weights)
-
-            # SAE losses
             x_recon = features['x_recon']
             z_pre = features['z_pre']
             recon_loss = F.mse_loss(x_recon, batch_x)
             sparsity_loss = config.lambda_sparsity * z_pre.abs().mean()
 
-            # Bimodality loss
             z_bin = features['z_binary']
             bimodal_raw = (z_bin * (1.0 - z_bin)).mean()
+            
             if epoch_idx < config.bimodal_warmup:
-                bimodal_weight = 0.0
+                bimodal_weight = current_entropy_weight = 0.0
             else:
                 progress = min(1.0, (epoch_idx - config.bimodal_warmup) / max(config.bimodal_ramp, 1))
                 bimodal_weight = config.bimodal_max * progress
+                current_entropy_weight = config.entropy_weight * progress
+                
             bimodal_loss = bimodal_weight * bimodal_raw
-
-            # Logic complexity
             logic_complexity = model.logic_layer.complexity_penalty()
+            logic_entropy = model.logic_layer.entropy_penalty()
 
-            total_loss = (
-                config.alpha_recon * recon_loss +
-                sparsity_loss +
-                config.beta_action * action_loss +
-                bimodal_loss +
-                logic_complexity
-            )
+            total_loss = (config.alpha_recon * recon_loss + sparsity_loss + config.beta_action * action_loss + 
+                          bimodal_loss + logic_complexity + (current_entropy_weight * logic_entropy))
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(model.sae.parameters()) + 
-                list(model.bottleneck.parameters()) + 
-                list(model.logic_layer.parameters()),
-                config.max_grad_norm
-            )
+            torch.nn.utils.clip_grad_norm_(list(model.sae.parameters()) + list(model.bottleneck.parameters()) + 
+                                           list(model.logic_layer.parameters()), config.max_grad_norm)
             optimizer.step()
 
-            # Normalize decoder dictionary weights
-            with torch.no_grad():
-                model.sae._normalize_decoder()
+            with torch.no_grad(): model.sae._normalize_decoder()
 
             acc = (action_logits.argmax(1) == batch_a).float().mean()
             near_binary = ((z_bin < 0.05) | (z_bin > 0.95)).float().mean()
 
             train_info.append({
-                'total_loss': total_loss.item(),
-                'recon_loss': recon_loss.item(),
-                'sparsity_loss': sparsity_loss.item(),
-                'action_loss': action_loss.item(),
-                'bimodal_loss': bimodal_loss.item(),
-                'bimodal_weight': bimodal_weight,
-                'bimodal_raw': bimodal_raw.item(),
-                'logic_complexity': logic_complexity.item(),
-                'accuracy': acc.item(),
-                'near_binary_frac': near_binary.item(),
-                'feature_density': (features['z_sparse'] > 0).float().mean().item(),
-                'bottleneck_mean': z_bin.mean().item(),
-                'bottleneck_std': z_bin.std().item(),
-                'alpha_mean': model.bottleneck.get_sharpness().mean().item(),
+                'total_loss': total_loss.item(), 'recon_loss': recon_loss.item(), 'sparsity_loss': sparsity_loss.item(),
+                'action_loss': action_loss.item(), 'bimodal_loss': bimodal_loss.item(), 'logic_entropy': logic_entropy.item(),
+                'current_entropy_weight': current_entropy_weight, 'accuracy': acc.item(), 'near_binary_frac': near_binary.item(),
+                'feature_density': (features['z_sparse'] > 0).float().mean().item(), 'bottleneck_mean': z_bin.mean().item(),
+                'alpha_mean': model.bottleneck.get_sharpness().mean().item()
             })
 
         scheduler.step()
         val_acc = evaluate(model, val_loader, device)
-
-        avg = avg_dict(train_info)
-        avg['val_acc'] = val_acc
-        avg['epoch'] = epoch
+        avg = {k: np.mean([d[k] for d in train_info]) for k in train_info[0].keys()}
+        avg.update({'val_acc': val_acc, 'epoch': epoch_idx})
         history.append(avg)
 
-        if (epoch + 1) % config.log_every == 0:
+        # --- LOGIC CẬP NHẬT BEST MODEL ---
+        is_better_acc = val_acc > best_val_acc
+        is_same_acc_but_lower_loss = (val_acc == best_val_acc) and (avg['total_loss'] < best_loss)
+
+        if is_better_acc or is_same_acc_but_lower_loss:
+            best_val_acc, best_loss = val_acc, avg['total_loss']
+            best_model_state = {'model': model.state_dict(), 'epoch': epoch_idx, 'val_acc': val_acc}
+            if is_same_acc_but_lower_loss and (epoch_idx + 1) % config.log_every == 0:
+                 print(f"    [Best Model Updated] Epoch {epoch_idx+1}: Lower Loss ({avg['total_loss']:.4f}) at Acc {val_acc:.3f}")
+
+        if (epoch_idx + 1) % config.log_every == 0:
             lr_now = optimizer.param_groups[-1]['lr']
             print(
-                f"  Epoch {epoch+1}/{config.n_epochs} | "
+                f"  Epoch {epoch_idx+1}/{config.n_epochs} | "
                 f"Loss: {avg['total_loss']:.4f} | "
                 f"Recon: {avg['recon_loss']:.4f} | "
                 f"Act: {avg['action_loss']:.4f} | "
                 f"TrainAcc: {avg['accuracy']:.3f} | "
                 f"ValAcc: {val_acc:.3f} | "
                 f"NearBin: {avg['near_binary_frac']:.3f} | "
+                f"Ent: {avg['logic_entropy']:.3f} | "
+                f"EntW: {avg['current_entropy_weight']:.3f} | "
                 f"LR: {lr_now:.1e}"
             )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_model_state = {
-                'model': model.state_dict(),
-                'epoch': epoch,
-                'val_acc': val_acc,
-            }
-            patience = 0
-        else:
-            patience += 1
-
     return best_model_state, best_val_acc, history
-
 
 # ============================================================================
 # Evaluation
@@ -544,12 +513,13 @@ def plot_training_history(history, save_dir):
     ax.set_xlabel('Epoch'); ax.set_ylabel('Fraction near {0,1}')
     ax.set_title('Bottleneck Binarization'); ax.set_ylim(0, 1.05); ax.grid(True, alpha=0.3)
 
+    # Cập nhật Plot để biểu diễn cả Bimodality và Entropy
     ax = axes[1, 0]
-    ax.plot(epochs, [h['bimodal_loss'] for h in history], label='Weighted', linewidth=2)
-    ax.plot(epochs, [h['bimodal_raw'] for h in history], label='Raw', alpha=0.7)
-    ax.plot(epochs, [h['bimodal_weight'] for h in history], label='Weight', linestyle='--', alpha=0.7)
-    ax.set_xlabel('Epoch'); ax.set_ylabel('Bimodality')
-    ax.set_title('Bimodality Loss & Weight'); ax.legend(); ax.grid(True, alpha=0.3)
+    ax.plot(epochs, [h['bimodal_loss'] for h in history], label='Bimodal Weighted', linewidth=2)
+    ax.plot(epochs, [h['logic_entropy'] for h in history], label='Entropy Penalty', linewidth=2, color='orange')
+    ax.plot(epochs, [h['current_entropy_weight'] for h in history], label='Entropy Weight', linestyle='--', alpha=0.7)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Loss Value')
+    ax.set_title('Discrete Penalties (Ramp-up)'); ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
     ax.plot(epochs, [h['alpha_mean'] for h in history], linewidth=2, color='purple')
@@ -652,6 +622,7 @@ def main(args):
         action_class_weights=tuple(args.action_class_weights),
         max_grad_norm=args.max_grad_norm,
         beta_action=args.beta_action,
+        entropy_weight=args.entropy_weight, # Khởi tạo trọng số Entropy
     )
 
     # --- Model ---
@@ -673,6 +644,7 @@ def main(args):
     print(f"\nArchitecture: {config.input_dim} → SAE({config.hidden_dim}, k={config.k}) → "
           f"FixedNorm → Sigmoid → Logic({config.n_clauses_per_action} clauses/action) → {config.n_actions}")
     print(f"  Joint train: {config.n_epochs} epochs")
+    print(f"  Bimodality & Entropy: warmup={config.bimodal_warmup}, ramp={config.bimodal_ramp}")
 
     model.to(device)
 
@@ -744,13 +716,11 @@ if __name__ == "__main__":
     parser.add_argument("--bimodal_ramp", type=int, default=80)
 
     parser.add_argument("--l0_penalty", type=float, default=1e-4)
+    # [MỚI] Cho phép tuỳ chỉnh Entropy Weight tối đa qua terminal
+    parser.add_argument("--entropy_weight", type=float, default=0.005,
+                        help="Maximum weight for the entropy penalty")
     parser.add_argument("--lambda_sparsity", type=float, default=5e-3)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
-    
-    # [MỚI] Nhận tham số Temperature từ Terminal
-    parser.add_argument("--tau_start", type=float, default=1.0)
-    parser.add_argument("--tau_end", type=float, default=0.1)
-    parser.add_argument("--tau_anneal_epochs", type=int, default=200)
 
     parser.add_argument("--save_dir", type=str, default="./sae_logic_joint_outputs")
     parser.add_argument(

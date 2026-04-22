@@ -14,14 +14,15 @@ No learnable scaler. No gradient wars. The logic layer sees a stable feature
 space from the start.
 
 Usage:
-    python train_sae_logic_v3.py \
+    python train_sae_logic.py \
         --features_path ./stage1_outputs/collected_data.pt \
         --stage1_path ./stage1_outputs/stage1_outputs.pt \
         --hidden_dim 300 --k 50 \
         --n_clauses_per_action 10 \
         --sae_pretrain_epochs 50 \
         --n_epochs 400 \
-        --save_dir ./sae_logic_v3_outputs
+        --save_dir ./sae_logic_v3_outputs \
+        --entropy_weight 0.05
 """
 
 import argparse
@@ -112,6 +113,18 @@ class ProductTNormLogicLayer(nn.Module):
     def complexity_penalty(self) -> torch.Tensor:
         p, n = self._get_selection_probs()
         return self.l0_penalty_weight * (p + n).mean()
+        
+    def entropy_penalty(self) -> torch.Tensor:
+        """
+        [MỚI] Ép cụm (p, n, absent) về dạng one-hot 
+        (chỉ 1 giá trị xấp xỉ 1, các giá trị còn lại xấp xỉ 0)
+        """
+        p, n = self._get_selection_probs()
+        a = 1.0 - p - n # Xác suất bỏ qua (absent)
+        
+        # Thêm 1e-8 để tránh lỗi log(0)
+        entropy = - (p * torch.log(p + 1e-8) + n * torch.log(n + 1e-8) + a * torch.log(a + 1e-8))
+        return entropy.mean()
 
     def extract_rules(self, feature_names=None, action_names=None, threshold=0.3):
         if feature_names is None:
@@ -186,6 +199,9 @@ class SAELogicConfig:
     bimodal_max: float = 0.3
     bimodal_warmup: int = 30  # epochs into Stage 2
     bimodal_ramp: int = 80
+    
+    # [MỚI] Trọng số mục tiêu cho hàm Entropy (Sẽ scale dần từ 0 lên entropy_weight)
+    entropy_weight: float = 0.05
 
     action_class_weights: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
 
@@ -218,9 +234,6 @@ class SAELogicAgentV3(nn.Module):
     
     Stage 1: SAE trained for reconstruction (frozen after convergence)
     Stage 2: Fixed normalization → sigmoid bottleneck → product t-norm logic
-    
-    The key invariant: the logic layer ALWAYS sees features from the same
-    distribution. No moving targets.
     """
 
     def __init__(self, config: SAELogicConfig, device: str = "cpu"):
@@ -267,11 +280,6 @@ class SAELogicAgentV3(nn.Module):
     def compute_z_normalization(self, loader: DataLoader):
         """
         Compute per-feature mean and std of SAE activations over the dataset.
-        
-        Only considers non-zero activations (since top-k makes most entries 0).
-        For features that are never active, std defaults to 1.0 (passthrough).
-        
-        Must be called AFTER SAE pretraining and BEFORE logic training.
         """
         print("\n  Computing SAE activation statistics...")
         self.sae.eval()
@@ -302,9 +310,9 @@ class SAELogicAgentV3(nn.Module):
 
         self.z_mean.copy_(z_mean.to(self.z_mean.device))
         self.z_std.copy_(z_std.to(self.z_std.device))
+        
         # Verify
         z_normed = (all_z - z_mean) / z_std
-        # For active features, should be roughly centered
         active_mask = all_z > 0
         active_normed = z_normed[active_mask]
         print(f"    Raw SAE activations: mean={all_z[active_mask].mean():.2f}, "
@@ -349,10 +357,11 @@ class SAELogicAgentV3(nn.Module):
             }
         return action_logits
 
-    def extract_rules(self, concept_labels=None, action_names=None):
+    def extract_rules(self, concept_labels=None, action_names=None, threshold=0.3):
         return self.logic_layer.extract_rules(
             feature_names=concept_labels,
             action_names=action_names,
+            threshold=threshold
         )
 
 
@@ -509,23 +518,32 @@ def train_logic(
             # Action loss
             action_loss = F.cross_entropy(action_logits, batch_a, weight=class_weights)
 
-            # Bimodality loss (annealed from start of Stage 2)
+            # --- TÍNH TOÁN BÀI TOÁN LÀM CỨNG (DISCRETE PENALTIES) ---
             z_bin = features['z_binary']
             bimodal_raw = (z_bin * (1.0 - z_bin)).mean()
+            
+            # [MỚI] Tăng dần trọng số của Bimodal và Entropy theo cùng một lộ trình (Ramp-up)
             if epoch_idx < config.bimodal_warmup:
                 bimodal_weight = 0.0
+                current_entropy_weight = 0.0 # Giai đoạn tự do (Warmup)
             else:
                 progress = min(1.0, (epoch_idx - config.bimodal_warmup) / max(config.bimodal_ramp, 1))
                 bimodal_weight = config.bimodal_max * progress
+                current_entropy_weight = config.entropy_weight * progress # Giai đoạn siết chặt
+                
             bimodal_loss = bimodal_weight * bimodal_raw
 
             # Logic complexity
             logic_complexity = model.logic_layer.complexity_penalty()
+            
+            # [MỚI] Logic Entropy Penalty
+            logic_entropy = model.logic_layer.entropy_penalty()
 
             total_loss = (
                 config.beta_action * action_loss +
                 bimodal_loss +
-                logic_complexity
+                logic_complexity +
+                (current_entropy_weight * logic_entropy) # Áp dụng Entropy Weight biến thiên
             )
 
             optimizer.zero_grad()
@@ -546,6 +564,8 @@ def train_logic(
                 'bimodal_weight': bimodal_weight,
                 'bimodal_raw': bimodal_raw.item(),
                 'logic_complexity': logic_complexity.item(),
+                'logic_entropy': logic_entropy.item(),
+                'current_entropy_weight': current_entropy_weight, # Lưu lại để in log
                 'accuracy': acc.item(),
                 'near_binary_frac': near_binary.item(),
                 'feature_density': (features['z_sparse'] > 0).float().mean().item(),
@@ -566,13 +586,11 @@ def train_logic(
             lr_now = optimizer.param_groups[1]['lr']
             print(
                 f"  Epoch {epoch+1}/{config.n_epochs} | "
-                f"Loss: {avg['total_loss']:.4f} | "
                 f"Act: {avg['action_loss']:.4f} | "
-                f"TrainAcc: {avg['accuracy']:.3f} | "
                 f"ValAcc: {val_acc:.3f} | "
                 f"NearBin: {avg['near_binary_frac']:.3f} | "
-                f"α: {avg['alpha_mean']:.1f} | "
-                f"BimW: {avg['bimodal_weight']:.2f} | "
+                f"Ent: {avg['logic_entropy']:.3f} | "       # In mức Entropy hiện tại
+                f"EntW: {avg['current_entropy_weight']:.3f} | " # In trọng số Entropy đang áp dụng
                 f"LR: {lr_now:.1e}"
             )
 
@@ -723,11 +741,10 @@ def plot_training_history(history, save_dir):
     ax.set_title('Bottleneck Binarization'); ax.set_ylim(0, 1.05); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
-    ax.plot(epochs, [h['bimodal_loss'] for h in history], label='Weighted', linewidth=2)
-    ax.plot(epochs, [h['bimodal_raw'] for h in history], label='Raw', alpha=0.7)
-    ax.plot(epochs, [h['bimodal_weight'] for h in history], label='Weight', linestyle='--', alpha=0.7)
-    ax.set_xlabel('Epoch'); ax.set_ylabel('Bimodality')
-    ax.set_title('Bimodality Loss & Weight'); ax.legend(); ax.grid(True, alpha=0.3)
+    ax.plot(epochs, [h['logic_entropy'] for h in history], label='Entropy', linewidth=2, color='orange')
+    ax.plot(epochs, [h['current_entropy_weight'] for h in history], label='Weight', linestyle='--', alpha=0.7)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Entropy')
+    ax.set_title('Logic Entropy Minimization'); ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
     ax.plot(epochs, [h['alpha_mean'] for h in history], linewidth=2, color='purple')
@@ -839,6 +856,7 @@ def main(args):
         bimodal_warmup=args.bimodal_warmup,
         bimodal_ramp=args.bimodal_ramp,
         l0_penalty_weight=args.l0_penalty,
+        entropy_weight=args.entropy_weight, # Khởi tạo trọng số mục tiêu
         lambda_sparsity=args.lambda_sparsity,
         sae_lr=args.sae_lr,
         logic_lr=args.logic_lr,
@@ -868,7 +886,7 @@ def main(args):
           f"FixedNorm → Sigmoid → Logic({config.n_clauses_per_action} clauses/action) → {config.n_actions}")
     print(f"  SAE pretrain: {config.sae_pretrain_epochs} epochs")
     print(f"  Logic train: {config.n_epochs - config.sae_pretrain_epochs} epochs")
-    print(f"  Bimodality: warmup={config.bimodal_warmup}, ramp={config.bimodal_ramp}, max={config.bimodal_max}")
+    print(f"  Bimodality & Entropy: warmup={config.bimodal_warmup}, ramp={config.bimodal_ramp}")
 
     # ============================
     # STAGE 1: Pre-train SAE
@@ -910,7 +928,7 @@ def main(args):
     print(f"\n{'='*70}")
     print("LEARNED RULES (DNF)")
     print(f"{'='*70}")
-    rules = model.extract_rules(action_names=action_names)
+    rules = model.extract_rules(action_names=action_names, threshold=args.threshold)
     for aname, clauses in rules.items():
         print(f"\n{aname} ←")
         for i, c in enumerate(dict.fromkeys(clauses)):
@@ -955,7 +973,7 @@ def main(args):
 
     plot_training_history(history, args.save_dir)
 
-    stats = model.logic_layer.count_active_rules(action_names=action_names)
+    stats = model.logic_layer.count_active_rules(action_names=action_names, threshold=args.threshold)
     print(f"\n{'='*70}")
     print("RULE STATISTICS")
     print(f"{'='*70}")
@@ -993,6 +1011,9 @@ if __name__ == "__main__":
     parser.add_argument("--bimodal_ramp", type=int, default=80)
 
     parser.add_argument("--l0_penalty", type=float, default=1e-4)
+    # [MỚI] Cho phép tuỳ chỉnh Entropy Weight tối đa qua terminal
+    parser.add_argument("--entropy_weight", type=float, default=0.05,
+                        help="Maximum weight for the entropy penalty")
     parser.add_argument("--lambda_sparsity", type=float, default=5e-3)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
 
@@ -1007,5 +1028,7 @@ if __name__ == "__main__":
                     help="Use ICA initialization for SAE (default: True)")
     parser.add_argument("--no_ica_init", action="store_false", dest="use_ica_init",
                     help="Disable ICA initialization")
+    parser.add_argument("--threshold", type=float, default=0.3,
+                    help="Threshold for rule extraction")
     args = parser.parse_args()
     main(args)
