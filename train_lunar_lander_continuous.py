@@ -49,7 +49,7 @@ def main():
         policy="CnnPolicy",
         env=train_env,
         learning_rate=3e-4,
-        buffer_size=100000,
+        buffer_size=50000,
         batch_size=256,
         ent_coef="auto",
         gamma=0.99,
