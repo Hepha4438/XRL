@@ -50,7 +50,7 @@ def main():
         policy="CnnPolicy",
         env=train_env,
         learning_rate=3e-4,
-        buffer_size=50000, # Với ảnh 84x84, 50k bước sẽ chiếm khoảng ~1GB RAM
+        buffer_size=100000, # Với ảnh 84x84, 50k bước sẽ chiếm khoảng ~1GB RAM
         batch_size=256,
         ent_coef="auto",
         gamma=0.99,
@@ -73,7 +73,7 @@ def main():
     )
 
     print("Starting SAC training on pixels (84x84)...")
-    model.learn(total_timesteps=500_000, callback=eval_callback)
+    model.learn(total_timesteps=1_500_000, callback=eval_callback)
 
     # QUAN TRỌNG: Lưu model cuối cùng và loại bỏ Replay Buffer
     # Điều này sẽ biến file 3GB thành file ~15MB.
