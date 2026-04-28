@@ -12,11 +12,57 @@ LUCID employs a two-stage training procedure to prevent gradient interference an
 
 1.  **Feature Extraction & SAE Training**
     * Collect activations from the frozen PPO Encoder.
-    * Train a Sparse Autoencoder with **TopK** activation ($k=50$) to discover monosemantic concepts.
+    * Train a Sparse Autoencoder with **TopK** activation ($k$) to discover monosemantic concepts.
 2.  **Logic Induction & Semantic Grounding**
     * **Binarization Bottleneck:** Maps continuous SAE activations to Boolean values (0/1).
     * **Product T-Norm Logic Layer:** Induces DNF rules (AND-OR logic) to mimic the PPO's behavior.
     * **VLM Grounding:** Automatically labels SAE features using Gemini 2.5 Pro by triangulating Integrated Gradients heatmaps with DNF logical context.
+
+```
+Raw observation (MiniGrid)
+        │
+        ▼
+PPO CNN feature extractor  (frozen — never trained)
+        │  (N, d)
+        ▼
+Normalize  →  (x - mean) / std
+        │  (N, d)
+        ▼
+┌─────────────────────────────────────────────────┐
+│  SAE Pre-training (recon only)                  │
+│                                                 │
+│  Sparse Autoencoder (SAE)                       │
+│    encoder: Linear(d → D) + TopK(k=50)          │
+│    decoder: Linear(D → d) [unit-norm cols]      │
+│    loss: MSE reconstruction + L1 sparsity       │
+│                                                 │
+│  ► SAE frozen after convergence                 │
+│  ► Activation stats computed (fixed buffers)    │
+└─────────────────────────────────────────────────┘
+        │  sparse z  (N, D),  only k active per sample
+        ▼
+Fixed Normalization  →  (z - z_mean) / z_std
+        │  per-feature stats from non-zero activations (buffers, not learned)
+        ▼
+┌─────────────────────────────────────────────────┐
+│  Logic Training (SAE frozen)                    │
+│                                                 │
+│  Sigmoid Bottleneck                             │
+│    output_i = sigmoid(α_i · (z_i − β_i))        │
+│    α, β learnable per feature                   │
+│    bimodality loss pushes outputs toward {0, 1} │
+│            │                                    │
+│            ▼                                    │
+│  Product T-Norm Logic Layer (DNF)               │
+│    For each action:  OR(clause_1, ..., clause_n)│
+│    Each clause:      AND over soft literals     │
+│    literal = p·f + n·(1−f) + (1−p−n)·1          │
+│    p, n from 3-way softmax → differentiable     │
+└─────────────────────────────────────────────────┘
+        │  (N, num_actions)  action logits
+        ▼
+argmax  →  action
+```
 
 ---
 
