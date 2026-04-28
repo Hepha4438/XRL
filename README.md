@@ -201,7 +201,6 @@ python experiments/tau/run_tau_ablation.py \
 ├── train_sae_logic.py             # SAE pre-training and frozen feature logical induction
 ├── auto_label_concepts.py         # Generates feature heatmaps for VLM grounding
 ├── gemini_concept_labeler.py      # Uses Gemini to infer semantic labels for concepts
-├── sparse_concept_autoencoder.py  # Core Sparse Autoencoder implementation (TopK)
 ├── check_success_rules.py         # Evaluates rule outcomes and success rates
 ├── rule_completeness_test.py      # Tests the logical completeness of extracted rules
 └── experiments/
@@ -209,7 +208,7 @@ python experiments/tau/run_tau_ablation.py \
     ├── dt/                        # Decision Tree baselines (VIPER, SA-DT)
     ├── soft_dt/                   # Soft Decision Tree baseline
     ├── tau/                       # Threshold (τ) ablation studies
-    └── theorem2/                  # Theorem 2 fidelity guarantees verification
+    └── theorem/                   # Theorem fidelity guarantees verification
 ```
 
 ---
