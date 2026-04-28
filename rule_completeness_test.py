@@ -82,6 +82,7 @@ class HardRuleAgent:
 
     @torch.no_grad()
     def predict(self, obs, device="cpu"):
+        device = next(self.ppo_cnn.parameters()).device
         obs_t = torch.as_tensor(obs).float().to(device)
         
         # 1. Đi qua PPO CNN và SAE để lấy Z_binary
@@ -238,7 +239,7 @@ def evaluate_pure_boolean_engine(rules_dict, z_binary, true_actions, action_name
     print(f"Fallback Action used   : '{action_names[most_frequent_action_idx]}'")
     print(f"{'='*70}\n")
     
-    return most_frequent_action_idx
+    return most_frequent_action_idx, boolean_fidelity_pct
 
 def main():
     parser = argparse.ArgumentParser()
@@ -263,7 +264,7 @@ def main():
     # 1. Chạy đánh giá Offline
     print("Computing binary concepts (z_binary) for all offline samples...")
     z_binary = get_z_binary(model, features, device)
-    fallback_idx = evaluate_pure_boolean_engine(rules, z_binary, actions_tensor, action_names)
+    fallback_idx, af = evaluate_pure_boolean_engine(rules, z_binary, actions_tensor, action_names)
 
     # 2. Chạy Live Game nếu có đủ tham số
     if args.env_name and args.ppo_path:

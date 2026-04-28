@@ -153,15 +153,11 @@ class ConceptIGWrapper(torch.nn.Module):
         return z_binary[:, self.concept_idx]
 
 # ============================================================
-# FIXED: CLUSTERING LOGIC
-# ============================================================
 def get_cluster_medoids(items, top_k, reverse=True):
     if len(items) <= top_k:
         return sorted(items, key=lambda x: x['val'], reverse=reverse)
     
-    # SỬA LỖI 1: Dùng features (không gian CNN) thay vì raw observation (Categorical)
     X = np.array([item['feat'] for item in items])
-    
     kmeans = KMeans(n_clusters=top_k, random_state=42, n_init=10)
     kmeans.fit(X)
     
@@ -177,8 +173,6 @@ def collect_top_k_frames(ppo_cnn, logic_model, env_name, used_concepts, num_epis
     obs = env.reset()
     
     history = {c: {'act': [], 'inact': []} for c in used_concepts}
-    
-    # SỬA LỖI 2: Dùng Set Hashing để chặn hoàn toàn việc thu thập các khung cảnh giống hệt nhau
     seen_hashes = {c: {'act': set(), 'inact': set()} for c in used_concepts}
     
     print(f"\n[1] Collecting rollout data over {num_episodes} episodes...")
@@ -203,14 +197,12 @@ def collect_top_k_frames(ppo_cnn, logic_model, env_name, used_concepts, num_epis
             features = ppo_cnn(obs_tensor)
             logits, feats = logic_model(features, normalize_input=True, return_features=True)
             z_bin = feats['z_binary'][0].cpu().numpy()
-            
-            # Lấy vector biểu diễn (feature) để phục vụ việc tính toán K-Means
             feat_np = features[0].cpu().numpy()
             action = logits.argmax(dim=1).cpu().numpy()
         
         for c in used_concepts:
             val = float(z_bin[c])
-            obs_hash = hash(obs[0].tobytes()) # Hash toàn bộ pixel của Agent View
+            obs_hash = hash(obs[0].tobytes()) 
             
             item = {
                 'val': val,
@@ -218,7 +210,7 @@ def collect_top_k_frames(ppo_cnn, logic_model, env_name, used_concepts, num_epis
                 'frame': rendered_frame.copy(),
                 'agent_dir': agent_dir,
                 'is_minigrid': is_minigrid,
-                'feat': feat_np # Lưu lại đặc trưng CNN
+                'feat': feat_np 
             }
             
             if val > 0.1: 
@@ -230,7 +222,6 @@ def collect_top_k_frames(ppo_cnn, logic_model, env_name, used_concepts, num_epis
                     seen_hashes[c]['inact'].add(obs_hash)
                     history[c]['inact'].append(item)
                 
-        # Giữ cho bộ nhớ RAM không bị đầy, nhưng lấy số lượng lớn (1000) để K-Means gom cụm
         if step_idx > 0 and step_idx % 1000 == 0:
             for c in used_concepts:
                 if len(history[c]['act']) > 1000:
@@ -258,9 +249,6 @@ def collect_top_k_frames(ppo_cnn, logic_model, env_name, used_concepts, num_epis
             
         top_frames_dict[c] = {'act': act_medoids, 'inact': inact_medoids}
         
-        if len(act_medoids) < top_k:
-            print(f"  [Warning] C{c} only had {len(act_medoids)} unique active frames (Clustering limited).")
-            
     return top_frames_dict
 
 def generate_concept_summary(ppo_cnn, logic_model, concept_idx, top_frames_dict, save_dir, device, env_name):
@@ -328,6 +316,14 @@ def generate_concept_summary(ppo_cnn, logic_model, concept_idx, top_frames_dict,
         if item['is_minigrid']:
             rendered_obs = smart_render(obs_vis, cell_size=32)
             model_input_img = Image.fromarray(rendered_obs).resize((W, H), Image.NEAREST)
+            
+            # --- HIGHLIGHT AGENT POSITION (RED BOX) ---
+            draw_agent = ImageDraw.Draw(model_input_img)
+            cw, ch = W / 7.0, H / 7.0
+            x0, y0 = 3 * cw, 6 * ch
+            x1, y1 = 4 * cw, 7 * ch
+            draw_agent.rectangle([x0, y0, x1, y1], outline=(255, 0, 0), width=3)
+            # ------------------------------------------
         else:
             obs_vis_scaled = (obs_vis * 255).astype(np.uint8) if obs_vis.max() <= 1.0 else obs_vis.astype(np.uint8)
             model_input_img = Image.fromarray(obs_vis_scaled).resize((W, H), Image.LANCZOS)

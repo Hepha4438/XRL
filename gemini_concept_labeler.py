@@ -73,6 +73,38 @@ def get_environment_context(env_name):
 
 def build_prompt(env_name, top_k, rules_context=""):
     env_context = get_environment_context(env_name)
+    is_minigrid = 'MiniGrid' in env_name
+
+    # --- DYNAMIC RULES BASED ON ENVIRONMENT ---
+    if is_minigrid:
+        visual_rules = f"""
+1. HOLISTIC SYNTHESIS (God View + Agent View + Rules): Do NOT overly fixate on just one panel or one single row. Synthesize the big picture to find the COMMON DENOMINATOR! Look at the [God View] to understand the agent's overall situation (e.g., where is the key relative to the agent?). Use the [IG Heatmap] to see its local attention. Look at the [Logical Context] for the intended Action.
+2. THE "TURN" ANOMALY (CRITICAL DOMAIN KNOWLEDGE): Check the provided Logical Context. If the agent only has rules for ONE turning direction (e.g., 'TurnRight' but no 'TurnLeft', or vice versa), it means the agent uses that single action to CHANGE DIRECTION entirely. Therefore, do NOT automatically assume a turn means "obstacle ahead". It often triggers simply because a target (like a key) is off-center or behind the agent.
+3. SPATIAL MAPPING VIA RED BOX: The **RED BOX** in the [Agent View] represents the agent.
+   - CARRYING A KEY: Only if the yellow key is drawn strictly INSIDE the RED BOX.
+   - IN FRONT: Only if the object is in the cell strictly ABOVE the RED BOX.
+   - OFF-CENTER OR BEHIND: If the object is to the left, right, or in the bottom corners of the Agent View.
+4. HEATMAP AS A FOCAL POINT, NOT A BLINDER: The DARK RED spots show local attention. Trace them to the Agent View relative to the RED BOX. However, do NOT get tunnel vision. You must interpret what that highlighted cell means within the broader context of the [God View]. If the Heatmap says "Zero Attrib.", prioritize the holistic state (e.g., `likely_key_off_center`). 
+5. RL FUNCTIONAL SEMANTICS: If the concept triggers on visually different objects (e.g., an empty floor cell AND a door) that serve the SAME functional purpose (e.g., both allow moving 'Forward'), label it functionally (e.g., `traversable_path_ahead`).
+6. NAMING STRATEGY (CRITICAL): Your label MUST perfectly bridge the visual details across ALL {top_k} ON cases with the logical Action. Ask yourself: "What specific state is consistently present in ALL these images that makes the agent logically want to perform THIS specific action?". Do not name it based on a single outlier row.
+7. HOLISTIC FULL SCAN: You MUST scan ALL {top_k} ON cases from top to bottom before concluding.
+"""
+        red_box_notice = "**Notice the RED BOX drawn at the bottom-center: this permanently marks the agent's exact location.**"
+        task_mapping_instruction = "relative to the RED BOX"
+        task_reasoning_extra = "- Where the objects/attention are located RELATIVE to the RED BOX.\n   - How you formulated the label to act as the COMMON DENOMINATOR across all rows and the intended Action."
+    else:
+        visual_rules = f"""
+1. HOLISTIC SYNTHESIS (Full Render + Model Input + Rules): Do NOT overly fixate on just one panel or one single row. Synthesize the big picture to find the COMMON DENOMINATOR! Look at the [Full Render (ON)] to understand the global physical state. Use the [IG Heatmap] to pinpoint exactly which physical parts the network is attending to. Look at the [Logical Context] for the intended Action.
+2. 1-to-1 SPATIAL MAPPING (STRICT): Find the DARK RED pixels in the Heatmap. Trace them perfectly to the same location in the [Model Input (ON)] to identify EXACTLY what object, boundary, or state is located there. DO NOT hallucinate.
+3. HEATMAP AS A FOCAL POINT, NOT A BLINDER: The DARK RED spots show exactly where the network is looking, but you must interpret THAT spot within the broader context of the [Full Render (ON)]. If a Heatmap says "Zero Attrib.", base your conclusion STRICTLY on the rows that actually have clear DARK RED spots, while triangulating with the full render.
+4. RL FUNCTIONAL SEMANTICS: If the concept triggers on visually varying states that serve the SAME functional purpose for the action (e.g., different pole angles that both require moving the cart left to balance), label it functionally (e.g., `pole_falling_right`).
+5. NAMING STRATEGY (CRITICAL): Your label MUST perfectly bridge the visual details across ALL {top_k} ON cases with the logical Action. Ask yourself: "What specific state is consistently present in ALL these images that makes the agent logically want to perform THIS specific action?". Do not name it based on a single outlier row.
+6. HOLISTIC FULL SCAN: You MUST scan ALL {top_k} ON cases from top to bottom before concluding.
+"""
+        red_box_notice = ""
+        task_mapping_instruction = "by mapping the DARK RED spots"
+        task_reasoning_extra = "- What exact physical state or object the DARK RED heatmap is highlighting.\n   - How you formulated the label to act as the COMMON DENOMINATOR across all rows and the intended Action."
+    # ----------------------------------------
 
     prompt = f"""You are an expert AI researcher analyzing Concept Neurons in a Deep Reinforcement Learning agent.
 
@@ -81,14 +113,18 @@ def build_prompt(env_name, top_k, rules_context=""):
 {env_context}
 =========================================
 
-I am providing an image containing the Top {top_k} scenarios for a single concept neuron. 
+I am providing an image containing {top_k} ACTIVATED (ON) cases and {top_k} INACTIVE (OFF) cases for a single concept neuron (total {2 * top_k} scenarios to analyze). 
 The image uses a CONTRASTIVE layout. Each row directly compares an ACTIVATED state (ON) vs an INACTIVE state (OFF) for this concept. 
 There are 6 panels from left to right in each row:
 
 --- ACTIVATED EXAMPLES (Panels 1-3) ---
 1. Panel 1 (labeled [God View (ON)] or [Full Render (ON)]): The global, uncropped view of the game environment.
-2. Panel 2 (labeled [Agent View (ON)] or [Model Input (ON)]): The agent's actual visual observation. For MiniGrid environments, this is a local 7x7 grid where the agent is ALWAYS assumed to be at the bottom-center looking UP. It is NOT rotated to align with the global God View.
-3. Panel 3 (labeled [IG Heatmap (ON)]): The Integrated Gradients attribution map. This map aligns perfectly with Panel 2. Red/Jet areas show EXACTLY which pixels TRIGGERED the concept.
+2. Panel 2 (labeled [Agent View (ON)] or [Model Input (ON)]): The agent's actual visual observation. {red_box_notice}
+3. Panel 3 (labeled [IG Heatmap (ON)]): The Integrated Gradients attribution map using a 'JET' colormap. This map aligns perfectly 1:1 with Panel 2.
+   *** HEATMAP COLOR SCALE ***
+   - DARK RED / RED: Local attention / Highest attribution.
+   - YELLOW / GREEN: Medium to low attribution.
+   - DARK BLUE: Zero attribution (background/ignored).
 
 --- INACTIVE EXAMPLES (Panels 4-6) ---
 4. Panel 4 (labeled [God View (OFF)] or [Full Render (OFF)]): The global view when the concept is NOT activated.
@@ -100,37 +136,39 @@ There are 6 panels from left to right in each row:
         prompt += f"""
 =========================================
 **LOGICAL CONTEXT (CRITICAL HINT):**
-The AI agent explicitly uses this concept to make decisions. Here are the deduplicated DNF rules involving this concept:
+The AI agent explicitly uses this concept to make decisions. Here are the deduplicated rules involving this concept:
 {rules_context}
-
-*Hint: Use these rules to guide your visual search. If the concept triggers a 'Pickup' action, look for an object to pick up in the ON heatmaps.*
 =========================================
 """
 
-    prompt += """
+    prompt += f"""
+=========================================
+**CRITICAL VISUAL ANALYSIS RULES (DO NOT IGNORE):**
+{visual_rules}
+=========================================
+
 Your task:
-1. Perform Contrastive Analysis: Compare the ON panels with the OFF panels across ALL rows. What semantic feature is present in ON but missing in OFF? Look at the Red/Jet regions in the IG Heatmap.
-2. Evaluate Monosemanticity (Consistency vs Exceptions): Look closely at every single ON row. Does the concept trigger on exactly ONE clear semantic feature every single time? Or are there exceptions? (e.g., 7 rows show a key, but 1 row shows a wall/empty space).
-3. Assign a 'monoscore' from 0 to 5 evaluating how monosemantic the concept is:
-   - 5: Perfectly monosemantic (100% consistent across ALL ON panels).
+1. Perform Contrastive Analysis: Compare ON vs OFF panels across ALL {top_k} rows. Anchor your analysis on the DARK RED regions to find the focal point, but INTERPRET that focal point within the holistic context of the God View / Full Render and the position {task_mapping_instruction}. Avoid tunnel vision!
+2. Evaluate Monosemanticity (Consistency vs Exceptions): Look closely at EVERY SINGLE ON row. Does the concept consistently represent one functional state or holistic situation?
+3. Assign a 'monoscore' from 0 to 5:
+   - 5: Perfectly monosemantic (100% consistent functionally or visually across ALL ON panels).
    - 3-4: Mostly monosemantic, but with 1 or 2 clear exceptions/deviations.
-   - 1-2: Polysemantic (triggers on multiple distinct, unrelated features).
+   - 1-2: Polysemantic (triggers on multiple distinct, functionally unrelated features).
    - 0: Completely uninterpretable or random.
-4. Generate a concise, descriptive snake_case label based on the visual and logical evidence. Provide an OBJECTIVE assessment:
-   - If the concept is monosemantic, give it a specific, single-feature label. Do NOT use "super concept" labels (OR-ing unrelated things like "key_or_wall") if it clearly represents one main idea.
-   - Use hedging prefixes like "likely_", "mostly_", or "partially_" ONLY if a single semantic feature dominates the majority of the ON images but is missing in a few exceptions.
-   - If the concept is objectively polysemantic (triggers on completely different things), reflect the objective reality in the label based on what it actually captures (even if it results in a compound label).
+4. Generate a concise, descriptive snake_case label. **CRITICAL:** The label MUST be the ultimate common denominator that logically explains ALL {top_k} ON cases AND perfectly justifies the intended Action. Use prefixes like `likely_` if the visual evidence is mostly contextual (e.g., "Zero Attrib" rows) but the global view and Rules strongly imply a specific state.
 5. Assign a confidence score from 1 to 5 for your overall assessment.
-6. Provide reasoning explaining the contrast, the heatmaps, AND explicitly mentioning any exceptions that affected the monoscore.
+6. Provide reasoning explaining the contrast. You MUST explicitly state:
+   - What the God View / Full Render reveals about the overall situation.
+   {task_reasoning_extra}
 
 Output EXACTLY in this JSON format:
-{
+{{
   "concept_id": "C_ID_FROM_TITLE",
   "label": "your_snake_case_label",
   "monoscore": 4,
   "confidence": 4,
-  "reasoning": "Explain the contrast and explicitly note any exceptions across the rows."
-}
+  "reasoning": "Explain the contrast, emphasizing the holistic synthesis to find the COMMON DENOMINATOR across all rows, spatial mapping, and how the label justifies the Action."
+}}
 """
     return prompt
 
@@ -179,7 +217,6 @@ def main():
         try:
             img = Image.open(img_path)
             response = client.models.generate_content(
-                # Truyền tham số model_name vào đây
                 model=args.model_name,
                 contents=[prompt, img],
                 config=types.GenerateContentConfig(
@@ -214,7 +251,7 @@ def main():
     print(f"Model used: {args.model_name}")
     print("Preview of labeled Concepts:")
     
-    preview_count = min(5, len(results["concepts"]))
+    preview_count = min(10, len(results["concepts"]))
     for i, (cid, data) in enumerate(results["concepts"].items()):
         if i >= preview_count: break
         print(f"  - {cid}: {data['label']} (Mono: {data['monoscore']}/5, Conf: {data['confidence']}/5)")

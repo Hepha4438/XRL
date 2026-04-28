@@ -19,7 +19,6 @@ def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
     
     model = SAELogicAgentV3(config, device=device)
     model.load_state_dict(checkpoint['model_state'])
-    # Phục hồi stats chuẩn hóa từ checkpoint
     model.set_normalization(checkpoint['feature_mean'].to(device), checkpoint['feature_std'].to(device))
     if 'z_mean' in checkpoint:
         model.z_mean.copy_(checkpoint['z_mean'].to(device))
@@ -34,91 +33,96 @@ def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
     
     alpha_j = model.bottleneck.get_sharpness().detach() 
     beta_j = model.bottleneck.beta.detach()
+    
     p_probs, n_probs = model.logic_layer._get_selection_probs()
+    ignore_probs = 1.0 - p_probs - n_probs
+    
+    P_mask = (p_probs.detach() > tau) 
+    N_mask = (n_probs.detach() > tau) 
+    active_mask = P_mask | N_mask
+    global_active_concepts = active_mask.any(dim=0)
     
     n_actions = model.config.n_actions
     n_clauses_per_action = model.config.n_clauses_per_action
     
-    # -------------------------------------------------------------------------
-    # TRÍCH XUẤT LUẬT CỨNG (Tương đương với việc in ra Text)
-    # -------------------------------------------------------------------------
-    P_mask = (p_probs.detach() > tau) # Nhóm Literal Dương (Positive)
-    N_mask = (n_probs.detach() > tau) # Nhóm Literal Âm (Negative)
-    active_mask = P_mask | N_mask 
-    global_active_concepts = active_mask.any(dim=0)
-    
-    cb = model.logic_layer.clause_weight.detach() # Lấy Bias gốc
-    clause_sigmoid_weights = torch.sigmoid(cb)    # Tính sẵn Sigmoid(Bias) cho luật True
-    # -------------------------------------------------------------------------
+    cb = model.logic_layer.clause_weight.detach() 
+    clause_sigmoid_weights = torch.sigmoid(cb)    
     
     results = []
     fragile_eps_accum = torch.zeros(model.config.hidden_dim, device=device)
     
-    print(f"Processing Theorem 2 calculations (Tau={tau})...")
+    print(f"Processing Complete Theorem 2 Calculations (Tau={tau})...")
     
     for x in tqdm(features):
         with torch.no_grad():
             x = x.unsqueeze(0)
-            
-            # --- QUAN TRỌNG: CHUẨN HÓA DỮ LIỆU ĐẦU VÀO ---
             x_norm = model.normalize_input(x)
             
-            # --- T2-1: TÍNH HARD SCORE (Hard Concept + Hard Text Rule) ---
-            z_sparse, _ = model.sae.encode(x_norm) # Đã đổi x thành x_norm
+            # --- T2-1: HARD SCORE ---
+            z_sparse, _ = model.sae.encode(x_norm)
             z_prime = (z_sparse - model.z_mean) / model.z_std
-            c_hard = (z_prime > beta_j) # Tensor Boolean (True/False)
+            c_hard = (z_prime > beta_j) 
             has_active_lits = P_mask.any(dim=1) | N_mask.any(dim=1)
             
-            # Kiểm tra luật bằng Logic Boolean khắt khe
             p_violation = P_mask & (~c_hard)
             n_violation = N_mask & c_hard
             clause_violation = p_violation.any(dim=1) | n_violation.any(dim=1)
             clause_is_true = (~clause_violation) & has_active_lits
             
-            # Nếu mệnh đề True (~violation) và không rỗng, điểm là Sigmoid(bias). Nếu False, điểm là 0.
             clause_scores = clause_sigmoid_weights * clause_is_true.float()
-            
-            # Cộng dồn điểm cho từng hành động
             clause_scores = clause_scores.view(n_actions, n_clauses_per_action)
-            s_hard = clause_scores.sum(dim=1) # Shape: [n_actions]
+            s_hard = clause_scores.sum(dim=1)
             
             top_scores, top_indices = torch.topk(s_hard, k=2)
             gamma = top_scores[0] - top_scores[1]
+            top_action = top_indices[0].item()
 
-            # --- T2-2 & T2-3: Tính Perturbation Delta(x) (Concept binarization error) ---
-            delta_j = torch.abs(z_prime - beta_j).squeeze(0)
-            eps_j = 1.0 / (1.0 + torch.exp(alpha_j * delta_j))
+            # --- T2-2 & T2-3: EXACT PER-SAMPLE DELTA(x) ---
+            c_soft = model.bottleneck(z_prime).squeeze(0) # [D]
+            l_soft = p_probs * c_soft + n_probs * (1.0 - c_soft) + ignore_probs # [n_clauses, D]
             
-            log_one_minus_eps = torch.log(1.0 - eps_j + 1e-10)
-            clause_log_prod = torch.sum(active_mask * log_one_minus_eps, dim=1)
-            clause_deltas = 1.0 - torch.exp(clause_log_prod) 
-            global_delta = torch.sum(clause_deltas).item()
-
-            # --- T2-5: So sánh với mạng Soft (Soft Concept + Soft Logic) ---
-            s_soft = model(x_norm).squeeze(0) # Đã đổi x thành x_norm
-            c_soft = model.bottleneck(z_prime).squeeze(0)
+            # TRUE CLAUSE ERROR
+            clause_log_prod = torch.sum(torch.log(l_soft + 1e-10), dim=1) 
+            true_clause_deltas = clause_sigmoid_weights - torch.sigmoid(cb + clause_log_prod)
             
-            # So sánh Action
+            # FALSE CLAUSE ERROR
+            violated_mask = p_violation | n_violation
+            masked_l_soft = torch.where(violated_mask, l_soft, torch.tensor(0.0, device=device))
+            l_soft_star, _ = torch.max(masked_l_soft, dim=1) # Lấy literal vi phạm "lỏng" nhất làm Bound
+            false_clause_deltas = torch.sigmoid(cb + torch.log(l_soft_star + 1e-10))
+            
+            clause_deltas = torch.where(clause_is_true, true_clause_deltas, false_clause_deltas)
+            
+            # --- TIGHTER BOUND ---
+            clause_deltas_per_action = clause_deltas.view(n_actions, n_clauses_per_action)
+            delta_a = clause_deltas_per_action.sum(dim=1) 
+            
+            delta_a_star = delta_a[top_action].item()
+            mask_other = torch.ones(n_actions, dtype=torch.bool, device=device)
+            mask_other[top_action] = False
+            max_delta_other = torch.max(delta_a[mask_other]).item()
+            
+            tight_fidelity_bound = delta_a_star + max_delta_other
+            
+            # --- T2-5: Compare to Soft one ---
+            s_soft = model(x_norm).squeeze(0)
             agreement = (s_soft.argmax().item() == s_hard.argmax().item())
             
             results.append({
                 'gamma': gamma.item(),
-                'two_delta': 2 * global_delta,
+                'delta_bound': tight_fidelity_bound,
                 'agreement': agreement,
                 'c_soft_samples': c_soft.cpu().numpy()
             })
             
-            if gamma.item() <= 2 * global_delta:
-                fragile_eps_accum += (eps_j * global_active_concepts)
+            if gamma.item() <= tight_fidelity_bound:
+                fragile_eps_accum += ((1.0 - l_soft).max(dim=0)[0] * global_active_concepts)
 
-    # =========================================================================
-    # THỐNG KÊ KẾT QUẢ THEO CHUẨN LATEX
-    # =========================================================================
     gamma_arr = np.array([r['gamma'] for r in results])
-    two_delta_arr = np.array([r['two_delta'] for r in results]) 
+    delta_bound_arr = np.array([r['delta_bound'] for r in results]) 
     agree_arr = np.array([r['agreement'] for r in results])
     
-    covered_mask = gamma_arr > two_delta_arr
+    covered_mask = gamma_arr > delta_bound_arr
     uncovered_mask = ~covered_mask
     fidelity_coverage = np.mean(covered_mask) * 100
     
@@ -126,21 +130,24 @@ def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
     print(f"STEP T2-4: DISTRIBUTIONS (Mean, Median, Percentiles)")
     print(f"="*60)
     print(f"Gamma (Margin)     | Mean: {np.mean(gamma_arr):.3f} | Median: {np.median(gamma_arr):.3f} | 5th: {np.percentile(gamma_arr, 5):.3f} | 95th: {np.percentile(gamma_arr, 95):.3f}")
-    print(f"2*Delta (Bound)    | Mean: {np.mean(two_delta_arr):.3f} | Median: {np.median(two_delta_arr):.3f} | 5th: {np.percentile(two_delta_arr, 5):.3f} | 95th: {np.percentile(two_delta_arr, 95):.3f}")
+    print(f"Tight Bound (T2)   | Mean: {np.mean(delta_bound_arr):.3f} | Median: {np.median(delta_bound_arr):.3f} | 5th: {np.percentile(delta_bound_arr, 5):.3f} | 95th: {np.percentile(delta_bound_arr, 95):.3f}")
 
     print(f"\n" + "="*60)
-    print(f"STEP T2-5: EMPIRICAL VALIDATION OF THEOREM 2")
+    print(f"STEP T2-5: EMPIRICAL VALIDATION OF COMPLETE THEOREM 2")
     print(f"="*60)
     covered_agreement = np.mean(agree_arr[covered_mask]) * 100 if np.any(covered_mask) else 0.0
     uncovered_disagreement = np.mean(~agree_arr[uncovered_mask]) * 100 if np.any(uncovered_mask) else 0.0
     overall_agreement = np.mean(agree_arr) * 100
     
     print(f"Overall Soft vs Hard Agreement: {overall_agreement:.2f}%")
-    print(f"Fidelity Coverage:              {fidelity_coverage:.2f}% (Target: ≥ 95%)")
+    print(f"Fidelity Coverage:              {fidelity_coverage:.2f}%")
     print(f"Covered Agreement (Invariant):  {covered_agreement:.2f}%")
+    
     if covered_agreement < 100.0:
-        print("  -> NOTE: Theorem 2 bound (Delta) only accounts for Concept Binarization.")
-        print("     The remaining gap is the exact logic-thresholding error (Neuro-Symbolic Gap).")
+        print("  -> WARNING: Covered Agreement < 100%. This breaks the theoretical invariant!")
+    else:
+        print("  -> PERFECT! The combined bound (Concept + Selector Softness) successfully guarantees 100% agreement.")
+        
     print(f"Uncovered Disagreement Rate:    {uncovered_disagreement:.2f}%")
 
     print(f"\n" + "="*60)
@@ -148,15 +155,15 @@ def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
     print(f"="*60)
     if np.any(uncovered_mask):
         print(f"In the fragile zone (Uncovered states):")
-        print(f"  - Average Gamma:   {np.mean(gamma_arr[uncovered_mask]):.3f}")
-        print(f"  - Average 2*Delta: {np.mean(two_delta_arr[uncovered_mask]):.3f}")
+        print(f"  - Average Gamma:       {np.mean(gamma_arr[uncovered_mask]):.3f}")
+        print(f"  - Average Tight Bound: {np.mean(delta_bound_arr[uncovered_mask]):.3f}")
         
         top_fragile_concepts = torch.topk(fragile_eps_accum, k=5)
-        print(f"  - Top concepts contributing to Delta (Needs better binarization):")
+        print(f"  - Top concepts contributing to Combined Delta (Needs better binarization/entropy):")
         for idx, val in zip(top_fragile_concepts.indices, top_fragile_concepts.values):
-            if val > 0: print(f"      * Concept f_{idx.item()}: accumulated error = {val.item():.2f}")
+            if val > 0: print(f"      * Concept f_{idx.item()}: accumulated combined error = {val.item():.2f}")
     else:
-        print("No fragile states detected! Perfect binarization.")
+        print("No fragile states detected! Perfect logic crystallization.")
     print(f"="*60)
 
     save_path = os.path.join(output_dir, 'theorem2_analytics.pt')
