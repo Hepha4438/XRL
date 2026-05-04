@@ -85,11 +85,24 @@ def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
             clause_log_prod = torch.sum(torch.log(l_soft + 1e-10), dim=1) 
             true_clause_deltas = clause_sigmoid_weights - torch.sigmoid(cb + clause_log_prod)
             
-            # FALSE CLAUSE ERROR
+            # FALSE CLAUSE ERROR (ĐÃ FIX THEO CHUẨN LEMMA 1)
             violated_mask = p_violation | n_violation
-            masked_l_soft = torch.where(violated_mask, l_soft, torch.tensor(0.0, device=device))
-            l_soft_star, _ = torch.max(masked_l_soft, dim=1) # Lấy literal vi phạm "lỏng" nhất làm Bound
-            false_clause_deltas = torch.sigmoid(cb + torch.log(l_soft_star + 1e-10))
+            
+            # 1. Tìm literal vi phạm NHỎ NHẤT (Tightest Bound)
+            # Lót vô cùng (inf) cho các literal KHÔNG vi phạm để hàm min() bỏ qua chúng
+            masked_l_soft_min = torch.where(violated_mask, l_soft, torch.tensor(float('inf'), device=device))
+            l_soft_star_min, _ = torch.min(masked_l_soft_min, dim=1)
+            
+            # Tính sai số cho False Clause bình thường
+            false_clause_violated_deltas = torch.sigmoid(cb + torch.log(l_soft_star_min + 1e-10))
+            
+            # 2. Xử lý lỗi EMPTY CLAUSE (Luật rỗng)
+            # Hard = 0, Soft = C_soft. Sai số chính là toàn bộ giá trị Soft!
+            empty_clause_mask = ~has_active_lits
+            empty_clause_deltas = torch.sigmoid(cb + clause_log_prod) # Đây chính là C_soft hiện tại
+            
+            # Kết hợp: Nếu là empty clause thì lấy empty_deltas, nếu không thì lấy violated_deltas
+            false_clause_deltas = torch.where(empty_clause_mask, empty_clause_deltas, false_clause_violated_deltas)
             
             clause_deltas = torch.where(clause_is_true, true_clause_deltas, false_clause_deltas)
             
