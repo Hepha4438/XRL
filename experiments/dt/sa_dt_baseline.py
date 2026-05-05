@@ -79,6 +79,22 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for environment evaluation.",
     )
+    parser.add_argument(
+        "--only-test",
+        action="store_true",
+        help="Skip training and only load/test existing model.",
+    )
+    parser.add_argument(
+        "--multi-seed",
+        action="store_true",
+        help="Run evaluation on fixed 5 seeds (42,43,44,45,46) with 1/5 episodes each.",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Path to the trained SA-DT model (.pkl file). If provided with --only-test, loads from this path instead of save_dir.",
+    )
 
     return parser.parse_args()
 
@@ -234,74 +250,134 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
 
 def main() -> None:
     args = parse_args()
-
-    # 1. Load data
-    print(f"Loading data from {args.data_path}...")
-    data = torch.load(args.data_path, map_location="cpu", weights_only=False)
-
-    if isinstance(data, dict):
-        if "features" in data and "actions" in data:
-            features = data["features"]
-            actions = data["actions"]
-        else:
-            raise KeyError("The .pt file is a dictionary but lacks 'features' or 'actions' keys.")
-    elif isinstance(data, tuple) and len(data) == 2:
-        features, actions = data
-    else:
-        raise ValueError("Unsupported data format in .pt file. Expected a dict or tuple.")
-
-    features_np = features.numpy().astype(np.float32)
-    actions_np = actions.numpy().astype(np.int64)
-
-    print(f"Features shape: {features_np.shape}, Actions shape: {actions_np.shape}")
-
-    # 2. Preprocess
-    print("Splitting data into train/test sets...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        features_np, actions_np, test_size=0.20, random_state=42
-    )
-
-    # 3. Model Training
-    print("Training State-Action Decision Tree (SA-DT)...")
-    clf = DecisionTreeClassifier(
-        max_depth=args.max_depth,
-        min_samples_leaf=args.min_samples_leaf,
-        random_state=42,
-    )
-    clf.fit(X_train, y_train)
-
-    # 4. Metrics Calculation
-    print("Calculating metrics...")
-    y_pred = clf.predict(X_test)
-    action_fidelity = accuracy_score(y_test, y_pred)
-
-    metrics = calculate_tree_metrics(clf)
-    metrics["Action Fidelity"] = float(action_fidelity)
-
-    # 4.5 Game Evaluation (Online rollout)
-    game_metrics = evaluate_on_env(clf, args)
-    metrics.update(game_metrics)
-
-    print("\n--- Metrics ---")
-    for key, val in metrics.items():
-        if isinstance(val, float):
-            print(f"{key}: {val:.4f}")
-        else:
-            print(f"{key}: {val}")
-    print("---------------\n")
-
-    # 5. Saving Artifacts
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Only-test mode: load existing model
+    if args.only_test:
+        print(f"[Only-Test Mode] Loading existing model...")
+        # Use provided model_path if available, otherwise use save_dir
+        if args.model_path:
+            model_path = Path(args.model_path)
+        else:
+            model_path = save_dir / "sa_dt_policy.pkl"
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found at {model_path}. Train first or provide correct path.")
+        clf = joblib.load(model_path)
+        print(f"Loaded SA-DT model from {model_path}")
+    else:
+        # Training mode
+        print(f"Loading data from {args.data_path}...")
+        data = torch.load(args.data_path, map_location="cpu", weights_only=False)
 
-    model_path = save_dir / "sa_dt_policy.pkl"
-    print(f"Saving model to {model_path}...")
-    joblib.dump(clf, model_path)
+        if isinstance(data, dict):
+            if "features" in data and "actions" in data:
+                features = data["features"]
+                actions = data["actions"]
+            else:
+                raise KeyError("The .pt file is a dictionary but lacks 'features' or 'actions' keys.")
+        elif isinstance(data, tuple) and len(data) == 2:
+            features, actions = data
+        else:
+            raise ValueError("Unsupported data format in .pt file. Expected a dict or tuple.")
 
-    metrics_path = save_dir / "sa_dt_metrics.json"
-    print(f"Saving metrics to {metrics_path}...")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=4)
+        features_np = features.numpy().astype(np.float32)
+        actions_np = actions.numpy().astype(np.int64)
+
+        print(f"Features shape: {features_np.shape}, Actions shape: {actions_np.shape}")
+
+        # 2. Preprocess
+        print("Splitting data into train/test sets...")
+        X_train, X_test, y_train, y_test = train_test_split(
+            features_np, actions_np, test_size=0.20, random_state=42
+        )
+
+        # 3. Model Training
+        print("Training State-Action Decision Tree (SA-DT)...")
+        clf = DecisionTreeClassifier(
+            max_depth=args.max_depth,
+            min_samples_leaf=args.min_samples_leaf,
+            random_state=42,
+        )
+        clf.fit(X_train, y_train)
+
+        # 4. Metrics Calculation
+        print("Calculating metrics...")
+        y_pred = clf.predict(X_test)
+        action_fidelity = accuracy_score(y_test, y_pred)
+
+        metrics = calculate_tree_metrics(clf)
+        metrics["Action Fidelity"] = float(action_fidelity)
+
+        # Save model
+        model_path = save_dir / "sa_dt_policy.pkl"
+        print(f"Saving model to {model_path}...")
+        joblib.dump(clf, model_path)
+
+        metrics_path = save_dir / "sa_dt_metrics.json"
+        print(f"Saving metrics to {metrics_path}...")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=4)
+
+    # Game Evaluation (Online rollout)
+    print("Evaluating on environment...")
+    game_metrics = evaluate_on_env(clf, args)
+
+    # Multi-seed evaluation
+    if args.multi_seed:
+        print(f"\nMulti-Seed Evaluation: Running on seeds [42,43,44,45,46] with {args.n_eval_episodes//5} episodes each...")
+        all_results = {}
+        for seed in [42, 43, 44, 45, 46]:
+            args.seed = seed
+            game_metrics = evaluate_on_env(clf, args)
+            all_results[seed] = game_metrics
+        
+        # Aggregate
+        print(f"\n{'='*70}")
+        print("MULTI-SEED AGGREGATED RESULTS")
+        print(f"{'='*70}")
+        for key in game_metrics.keys():
+            values = [all_results[seed][key] for seed in [42,43,44,45,46]]
+            mean_val = float(np.mean(values))
+            std_val = float(np.std(values))
+            print(f"{key:25s}: {mean_val:.4f} ± {std_val:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Save multi-seed metrics
+        if not args.only_test:
+            metrics_multiseed_path = save_dir / "sa_dt_metrics_multiseed.json"
+            multiseed_summary = {}
+            for key in game_metrics.keys():
+                values = [all_results[seed][key] for seed in [42,43,44,45,46]]
+                multiseed_summary[key] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "per_seed": {str(seed): float(all_results[seed][key]) for seed in [42,43,44,45,46]}
+                }
+            print(f"Saving multi-seed metrics to {metrics_multiseed_path}...")
+            with open(metrics_multiseed_path, "w") as f:
+                json.dump(multiseed_summary, f, indent=4)
+    else:
+        # Single-seed evaluation (original logic)
+        print("\n--- Metrics ---")
+        if not args.only_test:
+            metrics = {"Game Avg Return": game_metrics.get("Game Avg Return"), "Game Avg Length": game_metrics.get("Game Avg Length")}
+            for key, val in metrics.items():
+                if isinstance(val, float):
+                    print(f"{key}: {val:.4f}")
+                else:
+                    print(f"{key}: {val}")
+        else:
+            for key, val in game_metrics.items():
+                if isinstance(val, float):
+                    print(f"{key}: {val:.4f}")
+                else:
+                    print(f"{key}: {val}")
+        print("---------------\n")
 
     print("Success! SA-DT baseline execution completed.")
 

@@ -53,13 +53,15 @@ def evaluate(model: PPO, env, n_episodes: int, max_steps: int, deterministic: bo
 
 def main():
     parser = argparse.ArgumentParser(description="Test PPO PixelCartPole model")
-    parser.add_argument("--model_path", type=str, default="ppo_pixel_cartpole.zip")
+    parser.add_argument("--model_path", type=str, default="ppo_cartpole_converted.zip")
     parser.add_argument("--env_name", type=str, default="PixelCartPole-v0")
     parser.add_argument("--n_episodes", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=500)
     parser.add_argument("--deterministic", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--multi-seed", action="store_true",
+                        help="Run evaluation on fixed 5 seeds (42,43,44,45,46) with 1/5 episodes each.")
     args = parser.parse_args()
 
     # Set basic seeds for reproducibility
@@ -69,23 +71,62 @@ def main():
     print(f"Loading model: {args.model_path}")
     model = PPO.load(args.model_path, device=args.device)
 
-    print(f"Creating env: {args.env_name}")
-    # Render string is often tricky if running headless, None is safer here.
-    env = make_vec_env(args.env_name, render_mode=None, seed=args.seed)
+    if args.multi_seed:
+        # Multi-seed evaluation on 5 seeds
+        seeds = [42, 43, 44, 45, 46]
+        episodes_per_seed = args.n_episodes // 5
+        all_results = {}
 
-    print(f"Evaluating {args.n_episodes} episodes (deterministic={args.deterministic})")
-    metrics = evaluate(model, env, args.n_episodes, args.max_steps, args.deterministic)
-    env.close()
+        print(f"\nMulti-Seed Evaluation: Running on seeds {seeds} with {episodes_per_seed} episodes each")
+        print("=" * 70)
 
-    successes = metrics["successes"]
-    returns = metrics["returns"]
-    lengths = metrics["lengths"]
+        for seed in seeds:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
 
-    print("\nRESULTS")
-    print("=" * 50)
-    print(f"Success         : {successes}/{args.n_episodes} ({100.0 * successes / args.n_episodes:.2f}%)")
-    print(f"Avg return      : {returns.mean():.4f} +/- {returns.std():.4f}")
-    print(f"Avg ep length   : {lengths.mean():.1f} +/- {lengths.std():.1f}")
+            print(f"Seed {seed}...")
+            env = make_vec_env(args.env_name, render_mode=None, seed=seed)
+            metrics = evaluate(model, env, episodes_per_seed, args.max_steps, args.deterministic)
+            env.close()
+
+            success_rate = 100.0 * metrics["successes"] / episodes_per_seed
+            avg_return = metrics["returns"].mean()
+            avg_length = metrics["lengths"].mean()
+            all_results[seed] = {"success": success_rate, "return": avg_return, "length": avg_length}
+
+        # Aggregate results
+        print(f"\n{'='*70}")
+        print("MULTI-SEED AGGREGATED RESULTS")
+        print(f"{'='*70}")
+        success_rates = [all_results[s]["success"] for s in seeds]
+        avg_returns = [all_results[s]["return"] for s in seeds]
+        avg_lengths = [all_results[s]["length"] for s in seeds]
+
+        print(f"Success Rate    : {np.mean(success_rates):.4f} ± {np.std(success_rates):.4f} %")
+        print(f"Avg Return      : {np.mean(avg_returns):.4f} ± {np.std(avg_returns):.4f}")
+        print(f"Avg Ep Length   : {np.mean(avg_lengths):.4f} ± {np.std(avg_lengths):.4f}")
+        print(f"{'='*70}\n")
+    else:
+        # Single-seed evaluation
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+        print(f"Creating env: {args.env_name}")
+        env = make_vec_env(args.env_name, render_mode=None, seed=args.seed)
+
+        print(f"Evaluating {args.n_episodes} episodes (deterministic={args.deterministic})")
+        metrics = evaluate(model, env, args.n_episodes, args.max_steps, args.deterministic)
+        env.close()
+
+        successes = metrics["successes"]
+        returns = metrics["returns"]
+        lengths = metrics["lengths"]
+
+        print("\nRESULTS")
+        print("=" * 50)
+        print(f"Success         : {successes}/{args.n_episodes} ({100.0 * successes / args.n_episodes:.2f}%)")
+        print(f"Avg return      : {returns.mean():.4f} +/- {returns.std():.4f}")
+        print(f"Avg ep length   : {lengths.mean():.1f} +/- {lengths.std():.1f}")
 
 if __name__ == "__main__":
     main()

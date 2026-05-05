@@ -388,6 +388,21 @@ def train_logic(model, train_loader, val_loader, config, device):
                 f"LR: {lr_now:.1e}"
             )
 
+        if (epoch_idx + 1) % 100 == 0:
+            checkpoint_path = os.path.join(config.save_dir, f"sae_logic_joint_model_epoch_{epoch_idx+1}.pt")
+            rules = model.logic_layer.extract_rules(threshold=0.3)
+            torch.save({
+                'model_state': model.state_dict(),
+                'config': asdict(config),
+                'rules': rules,
+                'val_acc': val_acc,
+                'feature_mean': model.feature_mean.cpu(),
+                'feature_std': model.feature_std.cpu(),
+                'z_mean': model.z_mean.cpu(),
+                'z_std': model.z_std.cpu(),
+            }, checkpoint_path)
+            print(f"    [Checkpoint] Saved model to {checkpoint_path}")
+
     return best_model_state, best_val_acc, history
 
 # ============================================================================

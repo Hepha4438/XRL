@@ -164,12 +164,49 @@ def evaluate_live_game(agent, env_name, n_episodes=100, seed=42):
     avg_reward = np.mean(total_rewards)
     rule_trigger_rate = (triggered_steps / total_steps) * 100 if total_steps > 0 else 0.0
     
+    return {
+        "Success Rate": success_rate,
+        "Average Reward": avg_reward,
+        "Rule Trigger Rate": rule_trigger_rate
+    }
+
+def run_multi_seed_evaluation(ppo_model, logic_model, rules_dict, action_names, fallback_idx, env_name, episodes_per_seed, device):
+    """
+    Run live game evaluation across 5 seeds, aggregate results with mean±std.
+    """
+    seeds = [42, 43, 44, 45, 46]
+    all_results = {}
+    
+    ppo_cnn = ppo_model.policy.features_extractor
+    ppo_cnn.eval()
+    
+    for seed in seeds:
+        print(f"\n{'='*70}")
+        print(f"SEED {seed} (Episodes: {episodes_per_seed})")
+        print(f"{'='*70}")
+        
+        hard_agent = HardRuleAgent(
+            ppo_cnn=ppo_cnn,
+            logic_model=logic_model,
+            rules_dict=rules_dict,
+            action_names=action_names,
+            fallback_action_idx=fallback_idx
+        )
+        
+        metrics = evaluate_live_game(hard_agent, env_name, n_episodes=episodes_per_seed, seed=seed)
+        all_results[seed] = metrics
+    
+    # Aggregate
     print(f"\n{'='*70}")
-    print("LIVE GAME PERFORMANCE (HARD RULE + BIAS AGENT)")
+    print("MULTI-SEED AGGREGATED RESULTS (5 Seeds)")
     print(f"{'='*70}")
-    print(f"Success Rate       : {success_rate:.2f}%")
-    print(f"Average Reward     : {avg_reward:.4f}")
-    print(f"Live Trigger Rate  : {rule_trigger_rate:.2f}% (Steps where >= 1 rule fired)")
+    
+    for metric_name in ["Success Rate", "Average Reward", "Rule Trigger Rate"]:
+        values = [all_results[seed][metric_name] for seed in seeds]
+        mean_val = float(np.mean(values))
+        std_val = float(np.std(values))
+        print(f"{metric_name:25s}: {mean_val:8.4f} ± {std_val:.4f}")
+    
     print(f"{'='*70}\n")
 
 
@@ -234,8 +271,8 @@ def evaluate_pure_boolean_engine(rules_dict, z_binary, true_actions, action_name
     print("OFFLINE: SYMBOLIC ENGINE (Strict Boolean + Bias Weighting)")
     print(f"{'='*70}")
     print(f"Total States Evaluated : {n_samples}")
-    print(f"OVERALL COMPLETENESS   : {completeness_pct:.2f}%")
-    print(f"STRICT BOOLEAN FIDELITY: {boolean_fidelity_pct:.2f}%")
+    print(f"OVERALL COMPLETENESS   : {completeness_pct:.4f}%")
+    print(f"STRICT BOOLEAN FIDELITY: {boolean_fidelity_pct:.4f}%")
     print(f"Fallback Action used   : '{action_names[most_frequent_action_idx]}'")
     print(f"{'='*70}\n")
     
@@ -250,6 +287,8 @@ def main():
     parser.add_argument("--ppo_path", type=str, default="", help="Path to base PPO model (required for live eval)")
     parser.add_argument("--episodes", type=int, default=50, help="Number of live episodes")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for environment and evaluation")
+    parser.add_argument("--multi-seed", action="store_true",
+                        help="Run evaluation on fixed 5 seeds (42,43,44,45,46) with 1/5 episodes each")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -270,19 +309,43 @@ def main():
     if args.env_name and args.ppo_path:
         print(f"\nLoading PPO model from {args.ppo_path} for CNN feature extraction...")
         ppo_model = PPO.load(args.ppo_path, device=device)
-        ppo_cnn = ppo_model.policy.features_extractor
-        ppo_cnn.eval()
 
-        hard_agent = HardRuleAgent(
-            ppo_cnn=ppo_cnn, 
-            logic_model=model, 
-            rules_dict=rules, 
-            action_names=action_names, 
-            fallback_action_idx=fallback_idx
-        )
-        
-        # Truyền args.seed vào hàm đánh giá
-        evaluate_live_game(hard_agent, args.env_name, n_episodes=args.episodes, seed=args.seed)
+        # Multi-seed evaluation
+        if args.multi_seed:
+            episodes_per_seed = args.episodes // 5
+            print(f"\nMulti-Seed Mode: Running 5 seeds with {episodes_per_seed} episodes each (total {args.episodes})\n")
+            run_multi_seed_evaluation(
+                ppo_model=ppo_model,
+                logic_model=model,
+                rules_dict=rules,
+                action_names=action_names,
+                fallback_idx=fallback_idx,
+                env_name=args.env_name,
+                episodes_per_seed=episodes_per_seed,
+                device=device
+            )
+        else:
+            # Single-seed evaluation
+            ppo_cnn = ppo_model.policy.features_extractor
+            ppo_cnn.eval()
+
+            hard_agent = HardRuleAgent(
+                ppo_cnn=ppo_cnn, 
+                logic_model=model, 
+                rules_dict=rules, 
+                action_names=action_names, 
+                fallback_action_idx=fallback_idx
+            )
+            
+            # Truyền args.seed vào hàm đánh giá
+            metrics = evaluate_live_game(hard_agent, args.env_name, n_episodes=args.episodes, seed=args.seed)
+            print(f"\n{'='*70}")
+            print("LIVE GAME PERFORMANCE (HARD RULE + BIAS AGENT)")
+            print(f"{'='*70}")
+            print(f"Success Rate       : {metrics['Success Rate']:.4f}%")
+            print(f"Average Reward     : {metrics['Average Reward']:.4f}")
+            print(f"Live Trigger Rate  : {metrics['Rule Trigger Rate']:.4f}% (Steps where >= 1 rule fired)")
+            print(f"{'='*70}\n")
     else:
         print("\n[!] Skipping Live Game evaluation. Provide --env_name and --ppo_path to enable.")
 

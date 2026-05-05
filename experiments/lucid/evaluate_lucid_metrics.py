@@ -23,6 +23,39 @@ if ROOT_DIR not in sys.path:
 from check_success_rules import load_rules_agent, make_vec_env, ACTION_NAMES
 
 
+def run_multi_seed_evaluation(agent, env_name, n_episodes_per_seed, max_steps, seeds=[42,43,44,45,46]):
+    """
+    Run evaluation across multiple seeds, each with 1/5 of total episodes.
+    Returns aggregated results.
+    """
+    results_per_seed = {}
+    
+    for seed in seeds:
+        print(f"\n{'='*70}")
+        print(f"SEED {seed} (1/5 of episodes = {n_episodes_per_seed} episodes)")
+        print(f"{'='*70}")
+        env_metrics = evaluate_lucid_metrics(
+            agent,
+            env_name=env_name,
+            n_episodes=n_episodes_per_seed,
+            max_steps=max_steps,
+            seed=seed
+        )
+        results_per_seed[seed] = env_metrics
+    
+    # Aggregate results
+    aggregated = {}
+    for metric_name in results_per_seed[seeds[0]].keys():
+        values = [results_per_seed[seed][metric_name] for seed in seeds]
+        aggregated[metric_name] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "values": values
+        }
+    
+    return aggregated
+
+
 def calculate_lucid_complexity(agent):
     """
     Compute complexity metrics based on the rules extracted from the logic agent.
@@ -142,6 +175,8 @@ def main():
                         help="Max steps per episode")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for environment")
+    parser.add_argument("--multi-seed", action="store_true",
+                        help="Run evaluation on fixed 5 seeds (42,43,44,45,46) with 1/5 episodes each")
                         
     args = parser.parse_args()
     
@@ -150,6 +185,46 @@ def main():
     
     # 1. Load the agent
     agent = load_rules_agent(args.model_path, args.ppo_path, device)
+    
+    # Handle multi-seed evaluation
+    if args.multi_seed:
+        episodes_per_seed = args.n_episodes // 5
+        print(f"Multi-Seed Mode: Running 5 seeds with {episodes_per_seed} episodes each (total {args.n_episodes})\n")
+        aggregated_metrics = run_multi_seed_evaluation(
+            agent,
+            env_name=args.env_name,
+            n_episodes_per_seed=episodes_per_seed,
+            max_steps=args.max_steps,
+            seeds=[42, 43, 44, 45, 46]
+        )
+        
+        # Print aggregated results
+        print(f"\n{'='*70}")
+        print("AGGREGATED RESULTS (5 Seeds)")
+        print(f"{'='*70}")
+        for metric_name, stats in aggregated_metrics.items():
+            print(f"{metric_name:25s}: {stats['mean']:8.4f} ± {stats['std']:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Save aggregated metrics
+        save_dir = os.path.join(os.path.dirname(__file__), "results")
+        os.makedirs(save_dir, exist_ok=True)
+        metrics_path = os.path.join(save_dir, "metrics_multiseed.json")
+        
+        final_metrics = {
+            "mode": "multi-seed",
+            "seeds": [42, 43, 44, 45, 46],
+            "episodes_per_seed": episodes_per_seed
+        }
+        for metric_name, stats in aggregated_metrics.items():
+            final_metrics[metric_name] = {"mean": stats["mean"], "std": stats["std"]}
+        
+        with open(metrics_path, "w") as f:
+            json.dump(final_metrics, f, indent=4)
+        print(f"Multi-seed metrics saved to {metrics_path}")
+        return
+    
+    # Single-seed evaluation (original logic)
     
     # 2. Extract Complexity Metrics
     print("\nExtracting Complexity Metrics...")

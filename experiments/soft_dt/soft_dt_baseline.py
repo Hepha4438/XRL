@@ -94,6 +94,22 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for evaluation.",
     )
+    parser.add_argument(
+        "--only-test",
+        action="store_true",
+        help="Skip training and only load/test existing model.",
+    )
+    parser.add_argument(
+        "--multi-seed",
+        action="store_true",
+        help="Run evaluation on fixed 5 seeds (42,43,44,45,46) with 1/5 episodes each.",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help="Path to the trained Soft DT model (.pth file). If provided with --only-test, loads from this path instead of save_dir.",
+    )
     return parser.parse_args()
 
 
@@ -286,11 +302,13 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
-
-    # 1. Load data
+    
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load data (needed for both training and testing)
     print(f"Loading data from {args.data_path}...")
     data = torch.load(args.data_path, map_location="cpu")
-
     if isinstance(data, dict):
         if "features" in data and "actions" in data:
             features = data["features"]
@@ -301,99 +319,155 @@ def main() -> None:
         features, actions = data
     else:
         raise ValueError("Unsupported data format in .pt file. Expected a dict or tuple.")
-
-    # 2. Preprocess
-    dataset = TensorDataset(features, actions)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(
-        dataset, [train_size, test_size],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-
+    
     input_dim = features.shape[1]
     output_dim = len(torch.unique(actions))
-
-    # 3. Model Training
-    print(f"Initializing Sparse Soft Decision Tree (L1={args.l1_lambda})...")
-    model = SoftDecisionTree(input_dim=input_dim, output_dim=output_dim, depth=args.max_depth).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
-    print(f"Training for {args.epochs} epochs...")
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        train_loss = 0.0
-        for batch_x, batch_y in train_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            
-            optimizer.zero_grad()
-            output_probs = model(batch_x)
-            
-            # Cross Entropy Loss
-            log_probs = torch.log(output_probs + 1e-8)
-            nll_loss = F.nll_loss(log_probs, batch_y)
-            
-            # L1 Regularization Penalty
-            l1_penalty = torch.norm(model.routing.weight, p=1)
-            
-            loss = nll_loss + args.l1_lambda * l1_penalty
-            
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item() * batch_x.size(0)
-            
-        train_loss /= len(train_dataset)
-        
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch [{epoch}/{args.epochs}] -> Loss: {train_loss:.4f}")
-
-    # 4. Metrics Calculation
-    print("Calculating metrics...")
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch_x, batch_y in test_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            output_probs = model(batch_x)
-            preds = torch.argmax(output_probs, dim=1)
-            correct += (preds == batch_y).sum().item()
-            total += batch_y.size(0)
-
-    action_fidelity = correct / total
-
-    metrics = model.get_metrics()
-    metrics["Action Fidelity"] = float(action_fidelity)
-
-    # 4.5 Game Evaluation
-    game_metrics = evaluate_on_env(model, args, device)
-    metrics.update(game_metrics)
-
-    print("\n--- Metrics ---")
-    for key, val in metrics.items():
-        if isinstance(val, float):
-            print(f"{key}: {val:.4f}")
+    
+    # Only-test mode: load existing model
+    if args.only_test:
+        print(f"[Only-Test Mode] Loading existing Soft DT model with depth={args.max_depth}...")
+        # Use provided model_path if available, otherwise use save_dir
+        if args.model_path:
+            model_path = Path(args.model_path)
         else:
-            print(f"{key}: {val}")
-    print("---------------\n")
+            model_path = save_dir / "soft_dt_model.pth"
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found at {model_path}. Train first or provide correct path.")
+        
+        # Create model with specified depth from args
+        model = SoftDecisionTree(input_dim=input_dim, output_dim=output_dim, depth=args.max_depth).to(device)
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        model.eval()
+        print(f"Loaded Soft DT model from {model_path}")
+    else:
+        # Training mode
+        print(f"Initializing Sparse Soft Decision Tree (L1={args.l1_lambda})...")
+        
+        # Preprocess
+        dataset = TensorDataset(features, actions)
+        train_size = int(0.8 * len(dataset))
+        test_size = len(dataset) - train_size
+        train_dataset, test_dataset = random_split(
+            dataset, [train_size, test_size],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
 
-    # 5. Saving Artifacts
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model_path = save_dir / "soft_dt_model.pth"
-    print(f"Saving model to {model_path}...")
-    torch.save(model.state_dict(), model_path)
+        # Model Training
+        model = SoftDecisionTree(input_dim=input_dim, output_dim=output_dim, depth=args.max_depth).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    metrics_path = save_dir / "metrics.json"
-    print(f"Saving metrics to {metrics_path}...")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=4)
+        print(f"Training for {args.epochs} epochs...")
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_loss = 0.0
+            for batch_x, batch_y in train_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                
+                optimizer.zero_grad()
+                output_probs = model(batch_x)
+                
+                # Cross Entropy Loss
+                log_probs = torch.log(output_probs + 1e-8)
+                nll_loss = F.nll_loss(log_probs, batch_y)
+                
+                # L1 Regularization Penalty
+                l1_penalty = torch.norm(model.routing.weight, p=1)
+                
+                loss = nll_loss + args.l1_lambda * l1_penalty
+                
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item() * batch_x.size(0)
+                
+            train_loss /= len(train_dataset)
+            
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch [{epoch}/{args.epochs}] -> Loss: {train_loss:.4f}")
 
+        # Metrics Calculation
+        print("Calculating metrics...")
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                output_probs = model(batch_x)
+                preds = torch.argmax(output_probs, dim=1)
+                correct += (preds == batch_y).sum().item()
+                total += batch_y.size(0)
+
+        action_fidelity = correct / total
+
+        metrics = model.get_metrics()
+        metrics["Action Fidelity"] = float(action_fidelity)
+        
+        # Save model after training
+        model_path = save_dir / "soft_dt_model.pth"
+        print(f"Saving model to {model_path} (depth={args.max_depth})...")
+        torch.save(model.state_dict(), model_path)
+        
+        metrics_path = save_dir / "soft_dt_metrics.json"
+        print(f"Saving metrics to {metrics_path}...")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=4)
+
+    # Game Evaluation
+    print("Evaluating on environment...")
+    game_metrics = evaluate_on_env(model, args, device)
+
+    # Multi-seed evaluation
+    if args.multi_seed:
+        print(f"\nMulti-Seed Evaluation: Running on seeds [42,43,44,45,46] with {args.n_eval_episodes//5} episodes each...")
+        all_results = {}
+        for seed in [42, 43, 44, 45, 46]:
+            args_copy = type('obj', (object,), vars(args))()
+            args_copy.seed = seed
+            args_copy.n_eval_episodes = args.n_eval_episodes // 5
+            game_metrics_seed = evaluate_on_env(model, args_copy, device)
+            all_results[seed] = game_metrics_seed
+        
+        # Aggregate
+        print(f"\n{'='*70}")
+        print("MULTI-SEED AGGREGATED RESULTS")
+        print(f"{'='*70}")
+        for key in game_metrics.keys():
+            values = [all_results[seed][key] for seed in [42,43,44,45,46]]
+            mean_val = float(np.mean(values))
+            std_val = float(np.std(values))
+            print(f"{key:25s}: {mean_val:.4f} ± {std_val:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Save multi-seed metrics
+        if not args.only_test:
+            metrics_multiseed_path = save_dir / "soft_dt_metrics_multiseed.json"
+            multiseed_summary = {}
+            for key in game_metrics.keys():
+                values = [all_results[seed][key] for seed in [42,43,44,45,46]]
+                multiseed_summary[key] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "per_seed": {str(seed): float(all_results[seed][key]) for seed in [42,43,44,45,46]}
+                }
+            print(f"Saving multi-seed metrics to {metrics_multiseed_path}...")
+            with open(metrics_multiseed_path, "w") as f:
+                json.dump(multiseed_summary, f, indent=4)
+    else:
+        # Single-seed evaluation
+        print("\n--- Game Evaluation Metrics ---")
+        for key, val in game_metrics.items():
+            if isinstance(val, float):
+                print(f"{key}: {val:.4f}")
+            else:
+                print(f"{key}: {val}")
+        print("--------------------------------\n")
+    
     print("Success! Sparse Soft DT baseline execution completed.")
 
 if __name__ == "__main__":
