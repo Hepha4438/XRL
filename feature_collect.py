@@ -1,17 +1,13 @@
 """
-Stage 1: Feature Space Analysis
+Stage 1: Feature Collect
 ================================
-Analyzes the frozen PPO feature space before SAE training.
-
 Outputs:
-    - SVD: signal subspace V_k, effective dimensionality k, explained variance curve
-    - ICA: k identifiable directions in R^d (stable anchors for SAE init)
     - Feature normalization stats (mean, std)
     - Diagnostic plots and report
 
 Usage:
-    python feature_space_analysis.py --features_path ./collected_data/features.pt
-    python feature_space_analysis.py --model_path ppo_doorkey_6x6.zip --env_name MiniGrid-DoorKey-6x6-v0
+    python feature_collect.py --features_path ./collected_data/features.pt
+    python feature_collect.py --model_path ppo_doorkey_6x6.zip --env_name MiniGrid-DoorKey-6x6-v0
 """
 
 import argparse
@@ -25,156 +21,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.decomposition import FastICA
-from scipy.stats import kurtosis as scipy_kurtosis
-
-
-# ---------------------------------------------------------------------------
-# 1a  SVD Analysis
-# ---------------------------------------------------------------------------
-
-def svd_analysis(X: np.ndarray, variance_threshold: float = 0.99):
-    N, d = X.shape
-    mean = X.mean(axis=0)
-    X_centered = X - mean
-
-    if N > 5 * d:
-        cov = (X_centered.T @ X_centered) / (N - 1)
-        eigenvalues, V = np.linalg.eigh(cov)
-        idx = np.argsort(eigenvalues)[::-1]
-        eigenvalues = eigenvalues[idx]
-        V = V[:, idx]
-        singular_values = np.sqrt(np.maximum(eigenvalues * (N - 1), 0))
-    else:
-        _, singular_values, Vt = np.linalg.svd(X_centered, full_matrices=False)
-        V = Vt.T
-
-    var_explained = singular_values ** 2
-    total_var = var_explained.sum()
-    explained_ratio = var_explained / (total_var + 1e-12)
-    cumulative = np.cumsum(explained_ratio)
-
-    k = int(np.searchsorted(cumulative, variance_threshold) + 1)
-    k = min(k, d)
-
-    if d > 3:
-        log_sv = np.log(singular_values + 1e-12)
-        second_deriv = np.diff(log_sv, n=2)
-        elbow_idx = int(np.argmax(second_deriv)) + 2
-        k_elbow = elbow_idx
-    else:
-        k_elbow = d
-
-    print(f"\n{'='*60}")
-    print(f"SVD ANALYSIS")
-    print(f"{'='*60}")
-    print(f"  Feature dimension d        : {d}")
-    print(f"  Number of samples N        : {N}")
-    print(f"  Signal dim k ({variance_threshold*100:.0f}% var)   : {k}")
-    print(f"  Signal dim k (elbow)       : {k_elbow}")
-    print(f"  Top-1 explained variance   : {explained_ratio[0]*100:.1f}%")
-    print(f"  Top-10 explained variance  : {cumulative[min(9,d-1)]*100:.1f}%")
-    print(f"  Top-{k} explained variance  : {cumulative[k-1]*100:.1f}%")
-    print(f"  Condition number (σ1/σk)   : {singular_values[0]/(singular_values[k-1]+1e-12):.1f}")
-
-    if k < d:
-        noise_energy = var_explained[k:].sum() / total_var * 100
-        print(f"  Noise subspace energy      : {noise_energy:.2f}%")
-        print(f"  Noise dimensions           : {d - k}")
-
-    return {
-        "singular_values": singular_values,
-        "V": V,
-        "k": k,
-        "k_elbow": k_elbow,
-        "explained_var": explained_ratio,
-        "cumulative_var": cumulative,
-        "V_k": V[:, :k],
-        "V_noise": V[:, k:] if k < d else np.zeros((d, 0)),
-        "mean": mean,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 1b  ICA Analysis
-# ---------------------------------------------------------------------------
-
-def ica_analysis(X: np.ndarray, k: int, V_k: np.ndarray, n_runs: int = 5, seed: int = 42):
-    N, d = X.shape
-    mean = X.mean(axis=0)
-    X_centered = X - mean
-    X_pca = X_centered @ V_k
-
-    all_components = []
-    for run in range(n_runs):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            ica = FastICA(
-                n_components=k, algorithm="parallel", whiten="unit-variance",
-                max_iter=1000, tol=1e-4, random_state=seed + run,
-            )
-            S = ica.fit_transform(X_pca)
-            W = ica.components_
-        norms = np.linalg.norm(W, axis=1, keepdims=True)
-        W_norm = W / (norms + 1e-12)
-        all_components.append(W_norm)
-
-    W_ref = all_components[0]
-    A_ref = np.linalg.pinv(W_ref)
-    X_white = X_pca @ W_ref.T
-    kurt_values = np.array([scipy_kurtosis(X_white[:, i], fisher=True) for i in range(k)])
-
-    stability_scores = np.ones(k)
-    if n_runs > 1:
-        similarities_per_component = [[] for _ in range(k)]
-        for run_idx in range(1, n_runs):
-            W_other = all_components[run_idx]
-            cos_sim = np.abs(W_ref @ W_other.T)
-            matched = set()
-            for i in range(k):
-                available = [j for j in range(k) if j not in matched]
-                sims = cos_sim[i, available]
-                best_local = np.argmax(sims)
-                best_j = available[best_local]
-                matched.add(best_j)
-                similarities_per_component[i].append(cos_sim[i, best_j])
-        stability_scores = np.array([np.mean(s) if s else 1.0 for s in similarities_per_component])
-
-    ica_directions_d = (W_ref @ V_k.T).T
-    col_norms = np.linalg.norm(ica_directions_d, axis=0, keepdims=True)
-    ica_directions_d = ica_directions_d / (col_norms + 1e-12)
-
-    reliability = stability_scores * np.abs(kurt_values)
-    ica_rank = np.argsort(reliability)[::-1]
-
-    print(f"\n{'='*60}")
-    print(f"ICA ANALYSIS (k={k} components, {n_runs} runs)")
-    print(f"{'='*60}")
-    print(f"  Mean stability score       : {stability_scores.mean():.3f}")
-    print(f"  Stable components (>0.8)   : {(stability_scores > 0.8).sum()}/{k}")
-    print(f"  Stable components (>0.9)   : {(stability_scores > 0.9).sum()}/{k}")
-    print(f"  Mean |kurtosis|            : {np.abs(kurt_values).mean():.2f}")
-    print(f"\n  Top 10 components by reliability (stability × |kurtosis|):")
-    for rank, idx in enumerate(ica_rank[:10]):
-        print(
-            f"    {rank+1:2d}. IC {idx:3d}: "
-            f"stability={stability_scores[idx]:.3f}, "
-            f"kurtosis={kurt_values[idx]:+.2f}, "
-            f"reliability={reliability[idx]:.3f}"
-        )
-
-    signs = np.sign(
-        ica_directions_d[np.abs(ica_directions_d).argmax(axis=0), np.arange(k)]
-    )
-    ica_directions_d *= signs[np.newaxis, :]
-    return {
-        "ica_directions": ica_directions_d,
-        "mixing_matrix": A_ref,
-        "kurtosis_values": kurt_values,
-        "stability_scores": stability_scores,
-        "reliability": reliability,
-        "ica_rank": ica_rank,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -228,54 +74,12 @@ def action_distribution_analysis(actions: np.ndarray, n_actions: int = 7):
 # Visualization
 # ---------------------------------------------------------------------------
 
-def plot_diagnostics(svd_result, ica_result, norm_stats, action_stats, save_dir):
+def plot_diagnostics(norm_stats, action_stats, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, ax = plt.subplots(figsize=(6, 4))
     fig.suptitle("Stage 1: Feature Space Analysis", fontsize=14, fontweight="bold")
 
-    ax = axes[0, 0]
-    sv = svd_result["singular_values"]
-    ax.semilogy(range(1, len(sv) + 1), sv, "b.-", markersize=3)
-    ax.axvline(svd_result["k"], color="r", linestyle="--", alpha=0.7, label=f'k={svd_result["k"]}')
-    ax.axvline(svd_result["k_elbow"], color="g", linestyle="--", alpha=0.7, label=f'k_elbow={svd_result["k_elbow"]}')
-    ax.set_xlabel("Component index"); ax.set_ylabel("Singular value (log)")
-    ax.set_title("Singular Value Spectrum"); ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes[0, 1]
-    cum = svd_result["cumulative_var"]
-    ax.plot(range(1, len(cum) + 1), cum * 100, "b-", linewidth=2)
-    ax.axhline(95, color="r", linestyle="--", alpha=0.5, label="95%")
-    ax.axhline(99, color="orange", linestyle="--", alpha=0.5, label="99%")
-    ax.axvline(svd_result["k"], color="r", linestyle="--", alpha=0.3)
-    ax.set_xlabel("Number of components"); ax.set_ylabel("Cumulative variance (%)")
-    ax.set_title("Cumulative Explained Variance"); ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes[0, 2]
-    n_show = min(30, len(svd_result["explained_var"]))
-    ax.bar(range(1, n_show + 1), svd_result["explained_var"][:n_show] * 100, color="steelblue", alpha=0.8)
-    ax.set_xlabel("Component index"); ax.set_ylabel("Explained variance (%)")
-    ax.set_title(f"Per-Component Variance (top {n_show})"); ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 0]
-    kurt = ica_result["kurtosis_values"]
-    ranked_kurt = kurt[ica_result["ica_rank"]]
-    colors = ["green" if ica_result["stability_scores"][ica_result["ica_rank"][i]] > 0.8 else "red"
-              for i in range(len(ranked_kurt))]
-    ax.bar(range(1, len(ranked_kurt) + 1), np.abs(ranked_kurt), color=colors, alpha=0.7)
-    ax.set_xlabel("IC rank (by reliability)"); ax.set_ylabel("|Kurtosis|")
-    ax.set_title("ICA Components: |Kurtosis| (green=stable)"); ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 1]
-    stab = ica_result["stability_scores"]
-    sorted_stab = np.sort(stab)[::-1]
-    ax.bar(range(1, len(sorted_stab) + 1), sorted_stab, color="teal", alpha=0.7)
-    ax.axhline(0.8, color="r", linestyle="--", alpha=0.5, label="0.8 threshold")
-    ax.axhline(0.9, color="orange", linestyle="--", alpha=0.5, label="0.9 threshold")
-    ax.set_xlabel("IC rank (by stability)"); ax.set_ylabel("Stability score")
-    ax.set_title("ICA Stability Across Runs"); ax.legend(); ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 2]
     std = norm_stats["std"]
     ax.hist(std, bins=30, color="steelblue", alpha=0.7, edgecolor="black")
     ax.set_xlabel("Per-dimension std"); ax.set_ylabel("Count")
@@ -307,23 +111,10 @@ def plot_diagnostics(svd_result, ica_result, norm_stats, action_stats, save_dir)
 # Save / Load
 # ---------------------------------------------------------------------------
 
-def save_stage1_outputs(svd_result, ica_result, norm_stats, action_stats, save_dir):
+def save_stage1_outputs(norm_stats, action_stats, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
     stage1_data = {
-        "V_k": torch.from_numpy(svd_result["V_k"]).float(),
-        "V_noise": torch.from_numpy(svd_result["V_noise"]).float(),
-        "singular_values": torch.from_numpy(svd_result["singular_values"]).float(),
-        "explained_var": torch.from_numpy(svd_result["explained_var"]).float(),
-        "cumulative_var": torch.from_numpy(svd_result["cumulative_var"]).float(),
-        "k": svd_result["k"],
-        "k_elbow": svd_result["k_elbow"],
-        "feature_mean_svd": torch.from_numpy(svd_result["mean"]).float(),
-        "ica_directions": torch.from_numpy(ica_result["ica_directions"]).float(),
-        "ica_kurtosis": torch.from_numpy(ica_result["kurtosis_values"]).float(),
-        "ica_stability": torch.from_numpy(ica_result["stability_scores"]).float(),
-        "ica_reliability": torch.from_numpy(ica_result["reliability"]).float(),
-        "ica_rank": torch.from_numpy(ica_result["ica_rank"].copy()).long(),
         "feature_mean": torch.from_numpy(norm_stats["mean"]).float(),
         "feature_std": torch.from_numpy(norm_stats["std"]).float(),
         "action_counts": torch.from_numpy(action_stats["counts"]).long(),
@@ -336,14 +127,6 @@ def save_stage1_outputs(svd_result, ica_result, norm_stats, action_stats, save_d
     print(f"\n  Stage 1 outputs saved: {save_path}")
 
     summary = {
-        "feature_dim": int(svd_result["V"].shape[0]),
-        "signal_dim_k_95pct": int(svd_result["k"]),
-        "signal_dim_k_elbow": int(svd_result["k_elbow"]),
-        "top10_cumulative_var": float(svd_result["cumulative_var"][min(9, len(svd_result["cumulative_var"])-1)]),
-        "ica_n_stable_08": int((ica_result["stability_scores"] > 0.8).sum()),
-        "ica_n_stable_09": int((ica_result["stability_scores"] > 0.9).sum()),
-        "ica_mean_stability": float(ica_result["stability_scores"].mean()),
-        "ica_mean_abs_kurtosis": float(np.abs(ica_result["kurtosis_values"]).mean()),
         "feature_mean_range": [float(norm_stats["mean"].min()), float(norm_stats["mean"].max())],
         "feature_std_range": [float(norm_stats["std"].min()), float(norm_stats["std"].max())],
         "action_entropy": float(action_stats["entropy"]),
@@ -360,8 +143,6 @@ def save_stage1_outputs(svd_result, ica_result, norm_stats, action_stats, save_d
 def load_stage1_outputs(path):
     data = torch.load(path, map_location="cpu", weights_only=False)
     print(f"Loaded Stage 1 outputs from {path}")
-    print(f"  Signal dimension k: {data['k']}")
-    print(f"  ICA directions shape: {data['ica_directions'].shape}")
     return data
 
 
@@ -502,9 +283,6 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
 # ---------------------------------------------------------------------------
 
 def run_stage1(features: torch.Tensor, actions: torch.Tensor,
-               variance_threshold: float = 0.99,
-               ica_n_runs: int = 5,
-               seed: int = 42,
                save_dir: str = "./stage1_outputs"):
     X = features.numpy()
     A = actions.numpy().astype(int)
@@ -514,29 +292,14 @@ def run_stage1(features: torch.Tensor, actions: torch.Tensor,
     print(f"  N = {X.shape[0]}, d = {X.shape[1]}")
     print(f"{'#'*60}")
 
-    svd_result = svd_analysis(X, variance_threshold=variance_threshold)
-    ica_result = ica_analysis(
-        X, k=svd_result["k"], V_k=svd_result["V_k"],
-        n_runs=ica_n_runs, seed=seed
-    )
     norm_stats = compute_normalization_stats(X)
     action_stats = action_distribution_analysis(A)
-    plot_diagnostics(svd_result, ica_result, norm_stats, action_stats, save_dir)
-    save_path = save_stage1_outputs(svd_result, ica_result, norm_stats, action_stats, save_dir)
-
-    k = svd_result["k"]
-    d = X.shape[1]
-    n_stable_ica = int((ica_result["stability_scores"] > 0.8).sum())
+    plot_diagnostics(norm_stats, action_stats, save_dir)
+    save_path = save_stage1_outputs(norm_stats, action_stats, save_dir)
 
     print(f"\n{'='*60}")
     print(f"RECOMMENDATIONS FOR STAGE 2 (SAE TRAINING)")
     print(f"{'='*60}")
-    print(f"  Effective feature dim       : {k} (of {d})")
-    print(f"  Recommended hidden_dim (4x) : {4 * k}")
-    print(f"  Recommended hidden_dim (8x) : {8 * k}")
-    print(f"  Stable ICA anchors          : {n_stable_ica}")
-    print(f"  → Initialize first {n_stable_ica} decoder columns with stable ICA directions")
-    print(f"  → Use V_k for signal subspace regularization")
     print(f"  → Normalize features with saved mean/std before SAE training")
 
     return load_stage1_outputs(save_path)
@@ -547,7 +310,7 @@ def run_stage1(features: torch.Tensor, actions: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 1: Feature Space Analysis")
+    parser = argparse.ArgumentParser(description="Stage 1: Feature Space Analysis (No SVD/ICA)")
     parser.add_argument("--features_path", type=str, default=None,
                         help="Path to pre-collected features .pt file (with 'features' and 'actions' keys)")
     parser.add_argument("--model_path", type=str, default="ppo_doorkey_6x6.zip",
@@ -556,10 +319,6 @@ def main():
                         help="Environment name (used if --features_path not given)")
     parser.add_argument("--n_episodes", type=int, default=800,
                         help="Number of episodes to collect")
-    parser.add_argument("--variance_threshold", type=float, default=0.99,
-                        help="Cumulative variance threshold for signal dim k")
-    parser.add_argument("--ica_n_runs", type=int, default=5,
-                        help="Number of ICA runs for stability check")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="./stage1_outputs")
 
@@ -588,9 +347,6 @@ def main():
 
     stage1_data = run_stage1(
         features, actions,
-        variance_threshold=args.variance_threshold,
-        ica_n_runs=args.ica_n_runs,
-        seed=args.seed,
         save_dir=args.save_dir,
     )
 

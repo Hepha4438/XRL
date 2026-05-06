@@ -67,46 +67,48 @@ argmax  →  action
 ---
 
 ## Pipeline Execution
+
+Here is the cmd for MiniGrid-DoorKey-6x6-v0. For other environments, check file cmd
+
 ### Step 0: Pre-trained Teacher Policy
 Firstly, before running the LUCID pipeline, you must have a pre-trained Reinforcement Learning agent (e.g., PPO) that has already mastered the target environment. This agent acts as the "Teacher" from which we will extract logic rules. 
 
 If you don't have a pre-trained model, you can train one using the provided baseline script:
 
 ```bash
-python minigrid66.py
+python train_doorkey_6x6.py
 ```
-### Step 1: Feature Space Analysis
+### Step 1: Rollout data
 Collect rollout data from the PPO agent and compute initial normalization statistics.
 ```bash
-python feature_space_analysis.py \
-    --model_path ppo_doorkey_5x5.zip \
-    --env_name MiniGrid-DoorKey-5x5-v0 \
+python feature_collect.py \
+    --model_path ppo_doorkey_6x6.zip \
+    --env_name MiniGrid-DoorKey-6x6-v0 \
     --n_episodes 2000 \
-    --save_dir ./outputs/stage1
+    --save_dir ./stage1_outputs_doorkey
 ```
 ### Step 2: Joint SAE & Logic Training
 LUCID trains the neuro-symbolic pipeline in two stages. First, the SAE is pre-trained for reconstruction only (Stage 2A) to stabilize the feature space. Then, the SAE is frozen, and the Product T-Norm logic layer is trained (Stage 2B) to induce DNF rules based on those stable features.
 
 ```bash
 python train_joint.py \
-    --features_path ./outputs/stage1/collected_data.pt \
-    --stage1_path ./outputs/stage1/stage1_outputs.pt \
+    --features_path ./stage1_outputs_doorkey/collected_data.pt \
+    --stage1_path ./stage1_outputs_doorkey/stage1_outputs.pt \
     --hidden_dim 300 \
     --k 50 \
     --n_clauses_per_action 20 \
     --n_epochs 600 \
-    --threshold 0.5 \
     --max_grad_norm 5.0 \
     --save_training_data \
+    --seed 42 \
+    --threshold 0.5 \
     --entropy_weight 0.06 \
     --bimodal_ramp 120 \
-    --no_ica_init \
-    --save_dir ./outputs/lucid_model
+    --save_dir ./outputs/lucid_model_doorkey
 ```
 **Key Training Dynamics:**
-* **`--no_ica_init`**: Disables initializing SAE weights with ICA directions. This ensures the SAE learns features purely through TopK sparse reconstruction, preventing potential biases from linear ICA assumptions.
-* **Stage 2A (Pre-training):**: Minimizes MSE reconstruction loss to ensure the SAE captures all relevant PPO features before logic induction begins.
-* **Stage 2B (Logic Induction):**: Freezes SAE weights. It optimizes Cross-Entropy for action imitation while applying Bimodal and Entropy losses to ensure the final rules are discrete and concise.
+* **A:**: Minimizes MSE reconstruction loss to ensure the SAE captures all relevant PPO features before logic induction begins.
+* **B:**: It optimizes Cross-Entropy for action imitation while applying Bimodal and Entropy losses to ensure the final rules are discrete and concise.
 
 ---
 
@@ -115,20 +117,13 @@ Evaluate the performance of the induced rules against the original PPO teacher. 
 
 ```bash
 python experiments/lucid/evaluate_lucid_metrics.py \
-    --model_path ./outputs/lucid_model/sae_logic_joint_model.pt \
-    --ppo_path ppo_doorkey_6x6.zip \
-    --env_name MiniGrid-DoorKey-6x6-v0 \
-    --n_episodes 1000 \
-    --seed 42
-
-python rule_completeness_test.py \
-    --model_path ./outputs/lucid_model/sae_logic_joint_model.pt \
-    --features_path ./outputs/stage1/stage1_outputs.pt \
+    --model_path ./outputs/lucid_model_doorkey/sae_logic_joint_model.pt \
+    --features_path ./stage1_outputs_doorkey/collected_data.pt \
     --threshold 0.5 \
     --env_name MiniGrid-DoorKey-6x6-v0 \
     --ppo_path ./ppo_doorkey_6x6.zip \
     --episodes 1000 \
-    --seed 42
+    --multi-seed
 ```
 
 ### Step 4: Semantic Concept Grounding (VLM)
@@ -139,7 +134,7 @@ This step assigns human-readable labels to the discovered SAE concepts. It uses 
 
 ```bash
 python auto_label_concepts.py \
-    --model_path ./outputs/lucid_model/sae_logic_joint_model.pt \
+    --model_path ./outputs/lucid_model_doorkey/sae_logic_joint_model.pt \
     --ppo_path ./ppo_doorkey_6x6.zip \
     --env_name MiniGrid-DoorKey-6x6-v0 \
     --episodes 100 \
@@ -149,63 +144,76 @@ python gemini_concept_labeler.py \
     --img_dir ./concept_grounding/MiniGrid_DoorKey_6x6_v0 \
     --env_name "MiniGrid DoorKey 6x6" \
     --top_k 8 \
-    --rules_path ./joint_no_ica_outputs/learned_rules.json \
+    --rules_path ./outputs/lucid_model_doorkey/learned_rules.json \
     --model_name gemini-2.5-pro \
     --api_key YOUR_API_KEY
 ```
 
-### Step 5: Baseline Comparisons (Decision Trees)
-Compare LUCID's performance against standard interpretable baselines including SA-DT (State-Action Decision Tree), VIPER (DAgger-based Decision Tree), and Soft-DT.
-
-```bash
-python experiments/dt/sa_dt_baseline.py \
-    --ppo_path ppo_doorkey_6x6.zip \
-    --env_name MiniGrid-DoorKey-6x6-v0 \
-    --data_path stage1_outputs/collected_data.pt \
-    --save_dir ./experiments/dt/results \
-    --n_eval_episodes 1000 \
-    --max_depth 3 \
-    --seed 42
-
-python experiments/dt/viper_baseline.py \
-    --ppo_path ppo_doorkey_6x6.zip \
-    --env_name MiniGrid-DoorKey-6x6-v0 \
-    --max_depth 8 \
-    --seed 42 \
-    --save_dir experiments/dt/results/doorkey_6x6 \
-    --n_dagger_iters 75 \
-    --episodes_per_iter 50 \
-    --max_steps 100 \
-    --n_eval_episodes 1000 \
-    --min_samples_leaf 1
-
-python experiments/soft_dt/soft_dt_baseline.py \
-    --env_name MiniGrid-DoorKey-6x6-v0 \
-    --n_eval_episodes 1000 \
-    --max_depth 4 \
-    --seed 42 \
-    --epochs 1000
-```
-
-### Step 6: Ablation Studies (Threshold Sensitivity)
-Analyze how the binarization threshold $\tau$ affects the model's performance on held-out data. This helps verify the "Schelling optimality" of $\tau = 0.5$ as discussed in Theorem 1.
+### Step 5: Verify Theorem
+Validate the formal fidelity guarantees of the LUCID framework. This involves collecting held-out data with observations, verifying the logical fidelity against the teacher PPO model, and visualizing the results.
 
 ```bash
 python collect_with_observations.py \
     --model_path ppo_doorkey_6x6.zip \
     --env_name MiniGrid-DoorKey-6x6-v0 \
     --n_episodes 2000 \
-    --save_path held_out_evaluation_data.pt \
+    --save_path held_out_doorkey_data.pt \
     --seed 42
 
+python experiments/theorem/verify_fidelity.py \
+    --model_path ./outputs/lucid_model_doorkey/sae_logic_joint_model.pt \
+    --data_path ./held_out_doorkey_data.pt \
+    --output_dir ./experiments/theorem/results_doorkey
+
+python experiments/theorem/plot_fidelity_results.py \
+    --results_file ./experiments/theorem/results_doorkey/theorem2_analytics.pt \
+    --output_folder ./experiments/theorem/results_doorkey/figures
+```
+
+### Step 6: Ablation Studies (Threshold Sensitivity)
+Analyze how the binarization threshold $\tau$ affects the model's performance on held-out data. This helps verify the "Schelling optimality" of $\tau = 0.5$ as discussed in Theorem 1.
+
+```bash
 python experiments/tau/run_tau_ablation.py \
-    --model_path ./outputs/lucid_model/sae_logic_joint_model.pt \
-    --features_path ./held_out_evaluation_data.pt \
+    --model_path ./outputs/lucid_model_doorkey/sae_logic_joint_model.pt \
+    --features_path ./held_out_doorkey_data.pt \
     --env_name MiniGrid-DoorKey-6x6-v0 \
-    --output_dir ./experiments/tau/results \
+    --output_dir ./experiments/tau/results_doorkey \
     --episodes 1000
 ```
 
+### Step 7: Baseline Comparisons (Decision Trees)
+Compare LUCID's performance against standard interpretable baselines including SA-DT (State-Action Decision Tree), VIPER (DAgger-based Decision Tree), and Soft-DT.
+
+```bash
+python experiments/dt/sa_dt_baseline.py \
+    --ppo_path ppo_doorkey_6x6.zip \
+    --env_name MiniGrid-DoorKey-6x6-v0 \
+    --data_path stage1_outputs_doorkey/collected_data.pt \
+    --save_dir ./experiments/dt/results \
+    --n_eval_episodes 1000 \
+    --max_depth 4 \
+    --multi-seed
+
+python experiments/dt/viper_baseline.py \
+    --ppo_path ppo_doorkey_6x6.zip \
+    --env_name MiniGrid-DoorKey-6x6-v0 \
+    --max_depth 8 \
+    --save_dir experiments/dt/results/doorkey_6x6 \
+    --n_dagger_iters 75 \
+    --episodes_per_iter 50 \
+    --max_steps 100 \
+    --n_eval_episodes 1000 \
+    --multi-seed \
+    --min_samples_leaf 1
+
+python experiments/soft_dt/soft_dt_baseline.py \
+    --env_name MiniGrid-DoorKey-6x6-v0 \
+    --n_eval_episodes 1000 \
+    --max_depth 4 \
+    --multi-seed \
+    --epochs 1000
+```
 ---
 
 ### Key Results & Statistics
@@ -230,7 +238,6 @@ python experiments/tau/run_tau_ablation.py \
 
 | Argument | Description |
 | :--- | :--- |
-| `--no_ica_init` | Starts SAE from random initialization instead of ICA directions. |
 | `--entropy_weight` | Controls rule sparsity (L0 penalty). Higher values lead to shorter rules. |
 | `--bimodal_ramp` | Epochs to ramp up the Bimodal Loss, pushing outputs toward discrete {0, 1}. |
 | `--k` (TopK) | Sparsity constraint; the number of active SAE features per sample. |
@@ -244,11 +251,8 @@ python experiments/tau/run_tau_ablation.py \
 .
 ├── feature_space_analysis.py      # Step 1: Data collection & Subspace Analysis
 ├── train_joint.py                 # Step 2: Joint Logic & SAE training (LUCID)
-├── train_sae_logic.py             # SAE pre-training and frozen feature logical induction
 ├── auto_label_concepts.py         # Generates feature heatmaps for VLM grounding
 ├── gemini_concept_labeler.py      # Uses Gemini to infer semantic labels for concepts
-├── check_success_rules.py         # Evaluates rule outcomes and success rates
-├── rule_completeness_test.py      # Tests the logical completeness of extracted rules
 └── experiments/
     ├── lucid/                     # Fidelity and metrics evaluation
     ├── dt/                        # Decision Tree baselines (VIPER, SA-DT)
@@ -262,8 +266,7 @@ python experiments/tau/run_tau_ablation.py \
 ## 📜 Dependencies
 
 ```bash
-pip install torch gymnasium minigrid stable-baselines3
-pip install scikit-learn scipy matplotlib google-generativeai
+pip install -r requirements.txt
 ```
 
 ---

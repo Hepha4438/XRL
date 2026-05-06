@@ -6,7 +6,7 @@ import argparse
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-from train_sae_logic import SAELogicAgentV3, SAELogicConfig 
+from train_joint import SAELogicAgentV3, SAELogicConfig 
 
 def run_theorem2_analysis(model_path, data_path, output_dir, tau=0.5):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"

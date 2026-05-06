@@ -30,7 +30,7 @@ try:
 except ImportError:
     raise ImportError("Please install scikit-learn for clustering: pip install scikit-learn")
 
-from train_sae_logic import SAELogicAgentV3, SAELogicConfig
+from train_joint import SAELogicAgentV3, SAELogicConfig
 from check_success_rules import ACTION_NAMES, make_vec_env
 
 # ============================================================
