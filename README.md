@@ -68,7 +68,7 @@ argmax  →  action
 
 ## Pipeline Execution
 
-Here is the cmd for MiniGrid-DoorKey-6x6-v0. For other environments, check file cmd
+Below is the complete execution pipeline for the MiniGrid-DoorKey-6x6-v0 environment. For the commands to run other environments (such as Dynamic Obstacles or Pixel CartPole), please refer to the cmd file included in this repository.
 
 ### Step 0: Pre-trained Teacher Policy
 Firstly, before running the LUCID pipeline, you must have a pre-trained Reinforcement Learning agent (e.g., PPO) that has already mastered the target environment. This agent acts as the "Teacher" from which we will extract logic rules. 
