@@ -150,7 +150,12 @@ python gemini_concept_labeler.py \
 ```
 
 ### Step 5: Verify Theorem
-Validate the formal fidelity guarantees of the LUCID framework. This involves collecting held-out data with observations, verifying the logical fidelity against the teacher PPO model, and visualizing the results.
+This step empirically validates the **Soft-Hard Fidelity Guarantee (Theorem)** of the LUCID framework. The process analyzes the action margin $\gamma(x)$ against the conceptual perturbation bound $\Delta_{\text{total}}(x)$ to verify that the extracted discrete logic perfectly matches the continuous soft policy within the mathematically defined "safe zone".
+
+The validation pipeline consists of three sequential stages:
+1. **Data Collection**: Generate a massive held-out offline dataset to rigorously evaluate the theoretical error bounds on unseen states.
+2. **Fidelity Verification:** Compute the exact conceptual perturbations and action margins, formally separating the dataset into covered (safe) and uncovered (fragile) zones.
+3. **Visualization & Analytics:** Generate statistical plots (scatter plots of the bounds and binarization histograms) to report Binarization Cleanliness, Fidelity Coverage, and the $100\%$ Covered Agreement.
 
 ```bash
 python collect_with_observations.py \

@@ -250,7 +250,7 @@ python train_joint.py \
     --n_clauses_per_action 30 \
     --n_epochs 1000 \
     --threshold 0.5 \
-    --entropy_weight 0.00001 \
+    --entropy_weight 0.000001 \
     --bimodal_ramp 200 \
     --max_grad_norm 5.0 \
     --save_training_data \
