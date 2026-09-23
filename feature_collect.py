@@ -1,27 +1,24 @@
 """
 Stage 1: Feature Collect
 ================================
-Outputs:
-    - Feature normalization stats (mean, std)
-    - Diagnostic plots and report
-
-Usage:
-    python feature_collect.py --features_path ./collected_data/features.pt
-    python feature_collect.py --model_path ppo_doorkey_6x6.zip --env_name MiniGrid-DoorKey-6x6-v0
+Supports: MiniGrid, CartPole, Atari (Boxing, Pong, etc.)
 """
 
 import argparse
 import os
 import json
-import warnings
-
 import numpy as np
 import torch
 import matplotlib
 
+import ale_py
+import gymnasium as gym
+
+# Register Atari environments for Gymnasium
+gym.register_envs(ale_py)
+from utils_env import make_env_by_name
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 
 # ---------------------------------------------------------------------------
 # Feature normalization stats
@@ -48,13 +45,22 @@ def compute_normalization_stats(X: np.ndarray):
 # Action distribution analysis
 # ---------------------------------------------------------------------------
 
-def action_distribution_analysis(actions: np.ndarray, n_actions: int = 7):
-    action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
+def action_distribution_analysis(actions: np.ndarray, env_name: str = ""):
+    n_actions = int(actions.max()) + 1
+    
+    # Dynamically assign labels based on the environment type
+    if "MiniGrid" in env_name and n_actions <= 7:
+        action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
+        n_actions = 7
+    else:
+        # Generic labels for Atari or CartPole
+        action_names = [f"Action {i}" for i in range(n_actions)]
+
     counts = np.bincount(actions, minlength=n_actions)
     freqs = counts / counts.sum()
 
     print(f"\n{'='*60}")
-    print(f"ACTION DISTRIBUTION")
+    print(f"ACTION DISTRIBUTION ({env_name})")
     print(f"{'='*60}")
     print(f"  Total samples: {len(actions)}")
     for a in range(n_actions):
@@ -63,11 +69,10 @@ def action_distribution_analysis(actions: np.ndarray, n_actions: int = 7):
 
     freqs_nonzero = freqs[freqs > 0]
     entropy = -np.sum(freqs_nonzero * np.log2(freqs_nonzero))
-    max_entropy = np.log2(n_actions)
+    max_entropy = np.log2(n_actions) if n_actions > 1 else 1.0
     print(f"\n  Entropy: {entropy:.3f} / {max_entropy:.3f} (max)")
-    print(f"  Normalized entropy: {entropy/max_entropy:.3f}")
-
-    return {"counts": counts, "freqs": freqs, "entropy": entropy}
+    
+    return {"counts": counts, "freqs": freqs, "entropy": entropy, "names": action_names}
 
 
 # ---------------------------------------------------------------------------
@@ -77,34 +82,36 @@ def action_distribution_analysis(actions: np.ndarray, n_actions: int = 7):
 def plot_diagnostics(norm_stats, action_stats, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
+    # 1. Feature Std Plot
     fig, ax = plt.subplots(figsize=(6, 4))
     fig.suptitle("Stage 1: Feature Space Analysis", fontsize=14, fontweight="bold")
-
     std = norm_stats["std"]
     ax.hist(std, bins=30, color="steelblue", alpha=0.7, edgecolor="black")
     ax.set_xlabel("Per-dimension std"); ax.set_ylabel("Count")
     ax.set_title("Feature Std Distribution"); ax.grid(True, alpha=0.3)
-
     plt.tight_layout()
     plot_path = os.path.join(save_dir, "stage1_diagnostics.png")
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"\n  Diagnostic plot saved: {plot_path}")
 
-    fig2, ax2 = plt.subplots(figsize=(8, 4))
-    action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
+    # 2. Action Distribution Plot
+    fig2, ax2 = plt.subplots(figsize=(10, 4))
+    action_names = action_stats["names"]
     freqs = action_stats["freqs"]
+    
     bars = ax2.bar(action_names, freqs * 100, color="steelblue", alpha=0.8, edgecolor="black")
     ax2.set_ylabel("Frequency (%)"); ax2.set_title("Action Distribution in Rollout Data")
     ax2.grid(True, alpha=0.3, axis="y")
+    plt.xticks(rotation=45, ha="right")
+    
     for bar, f in zip(bars, freqs):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                 f"{f*100:.1f}%", ha="center", va="bottom", fontsize=9)
+                 f"{f*100:.1f}%", ha="center", va="bottom", fontsize=8)
+    
     plt.tight_layout()
     action_plot_path = os.path.join(save_dir, "action_distribution.png")
     plt.savefig(action_plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Action distribution plot saved: {action_plot_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +120,6 @@ def plot_diagnostics(norm_stats, action_stats, save_dir):
 
 def save_stage1_outputs(norm_stats, action_stats, save_dir):
     os.makedirs(save_dir, exist_ok=True)
-
     stage1_data = {
         "feature_mean": torch.from_numpy(norm_stats["mean"]).float(),
         "feature_std": torch.from_numpy(norm_stats["std"]).float(),
@@ -121,160 +127,152 @@ def save_stage1_outputs(norm_stats, action_stats, save_dir):
         "action_freqs": torch.from_numpy(action_stats["freqs"]).float(),
         "action_entropy": action_stats["entropy"],
     }
-
     save_path = os.path.join(save_dir, "stage1_outputs.pt")
     torch.save(stage1_data, save_path)
-    print(f"\n  Stage 1 outputs saved: {save_path}")
 
     summary = {
         "feature_mean_range": [float(norm_stats["mean"].min()), float(norm_stats["mean"].max())],
         "feature_std_range": [float(norm_stats["std"].min()), float(norm_stats["std"].max())],
         "action_entropy": float(action_stats["entropy"]),
     }
-
     summary_path = os.path.join(save_dir, "stage1_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"  Stage 1 summary saved: {summary_path}")
 
     return save_path
 
-
 def load_stage1_outputs(path):
-    data = torch.load(path, map_location="cpu", weights_only=False)
-    print(f"Loaded Stage 1 outputs from {path}")
-    return data
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 # ---------------------------------------------------------------------------
-# Data collection — NOW WITH OBSERVATIONS
+# Data collection (Supports MiniGrid, Atari, CartPole)
 # ---------------------------------------------------------------------------
 
 def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8):
-    """Collect features, actions, grid obs, AND pixel-rendered observations."""
-    import gymnasium as gym
-    import minigrid  # noqa: F401
-    from minigrid.wrappers import ImgObsWrapper
     from stable_baselines3 import PPO
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, VecFrameStack
+    from stable_baselines3.common.env_util import make_atari_env
     from tqdm import tqdm
-    
-    # Register ALE (Atari) environments if needed
-    try:
-        import ale_py  # noqa: F401
-    except Exception:
-        pass
-    
-    # Simple frame stack wrapper for Atari
-    class FrameStack(gym.Wrapper):
-        def __init__(self, env, num_stack=4):
-            super().__init__(env)
-            self.num_stack = num_stack
-            self.frames = collections.deque(maxlen=num_stack)
-            # Update observation space for stacked frames
-            shape = env.observation_space.shape
-            if len(shape) == 3:  # HWC
-                self.observation_space = gym.spaces.Box(
-                    low=env.observation_space.low.min(),
-                    high=env.observation_space.high.max(),
-                    shape=(shape[0], shape[1], shape[2] * num_stack),
-                    dtype=env.observation_space.dtype
-                )
-            else:  # Already grayscale or other
-                self.observation_space = gym.spaces.Box(
-                    low=env.observation_space.low.min(),
-                    high=env.observation_space.high.max(),
-                    shape=(*shape, num_stack),
-                    dtype=env.observation_space.dtype
-                )
-        
-        def _get_obs(self):
-            assert len(self.frames) == self.num_stack
-            frames_list = list(self.frames)
-            # Stack along last axis
-            stacked = np.concatenate(frames_list, axis=-1)
-            return stacked
-        
-        def reset(self, **kwargs):
-            obs, info = self.env.reset(**kwargs)
-            for _ in range(self.num_stack):
-                self.frames.append(obs)
-            return self._get_obs(), info
-        
-        def step(self, action):
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            self.frames.append(obs)
-            return self._get_obs(), reward, terminated, truncated, info
-    
-    import collections
 
     print(f"Loading PPO model from {model_path}...")
     model = PPO.load(model_path)
 
+    # 1. ENVIRONMENT DETECTION AND INITIALIZATION
+    is_minigrid = "MiniGrid" in env_name
+    is_atari = "NoFrameskip" in env_name or "Boxing" in env_name or "Pong" in env_name
+
     raw_env_ref = [None]
 
-    def make_env():
-        def _init():
-            from utils_env import make_env_by_name
-            env = make_env_by_name(env_name, render_mode="rgb_array", seed=seed)
-            raw_env_ref[0] = env
-            return env
-        return _init
+    if is_atari:
+        print(f"[*] Detected Atari environment: {env_name}")
+        env = make_atari_env(env_name, n_envs=1, seed=seed)
+        env = VecFrameStack(env, n_stack=4)
+        env = VecTransposeImage(env)
+    
+    elif is_minigrid:
+        print(f"[*] Detected MiniGrid environment: {env_name}")
+        import minigrid
+        from minigrid.wrappers import ImgObsWrapper
+        def make_env():
+            def _init():
+                e = gym.make(env_name, render_mode="rgb_array")
+                raw_env_ref[0] = e
+                e = ImgObsWrapper(e)
+                e.reset(seed=seed)
+                return e
+            return _init
+        env = DummyVecEnv([make_env()])
+        env = VecTransposeImage(env)
+        
+    else:
+        print(f"[*] Detected Classic/Other environment: {env_name}")
 
-    env = DummyVecEnv([make_env()])
-    # Apply VecTransposeImage for both MiniGrid and Atari (they output HWC format)
-    env = VecTransposeImage(env)
+        def make_env():
+            def _init():
+                e = make_env_by_name(
+                    env_name,
+                    render_mode="rgb_array",
+                    seed=seed
+                )
+                raw_env_ref[0] = e
+                return e
 
-    features_list = []
-    actions_list = []
-    obs_grid_list = []
-    obs_pixel_list = []
+            return _init
+        env = DummyVecEnv([make_env()])
+        env = VecTransposeImage(env)
 
-    print(f"Collecting {n_episodes} episodes...")
+    # 2. DATA COLLECTION LOOP
+    features_list, actions_list = [], []
+    obs_grid_list, obs_pixel_list = [], []
+
+    print(f"Collecting {n_episodes} episodes (Deterministic: True)...")
     obs = env.reset()
     episode_count = 0
 
     with torch.no_grad():
         pbar = tqdm(total=n_episodes)
         while episode_count < n_episodes:
-            raw_env = raw_env_ref[0].unwrapped
-            try:
-                # Grid encoding (for dedup / hashing)
-                grid_obs = raw_env.gen_obs()['image']
-                obs_grid_list.append(grid_obs.copy())
+            
+            # Extract observation specific to the environment type
+            if is_minigrid:
+                raw_env = raw_env_ref[0].unwrapped
+                try:
+                    grid_obs = raw_env.gen_obs()['image']
+                    obs_grid_list.append(grid_obs.copy())
+                    pixel_obs = raw_env.get_obs_render(grid_obs, tile_size=tile_size)
+                    obs_pixel_list.append(pixel_obs)
+                except Exception:
+                    obs_grid_list.append(np.zeros((7, 7, 3), dtype=np.uint8))
+                    obs_pixel_list.append(np.zeros((7 * tile_size, 7 * tile_size, 3), dtype=np.uint8))
+            
+            elif is_atari:
+                # Save raw Atari tensor directly (Shape: 4, 84, 84)
+                obs_grid_list.append(obs[0].copy())
+                obs_pixel_list.append(obs[0].copy())
+                
+            else:
+                obs_grid_list.append(obs[0].copy())
+                try:
+                    pixel_obs = raw_env_ref[0].render()
+                    obs_pixel_list.append(pixel_obs if pixel_obs is not None else obs[0].copy())
+                except:
+                    obs_pixel_list.append(obs[0].copy())
 
-                # Pixel render via MiniGrid's own renderer
-                # This handles orientation, agent marker, colors correctly
-                pixel_obs = raw_env.get_obs_render(grid_obs, tile_size=tile_size)
-                obs_pixel_list.append(pixel_obs)
-            except Exception:
-                obs_grid_list.append(np.zeros((7, 7, 3), dtype=np.uint8))
-                obs_pixel_list.append(
-                    np.zeros((7 * tile_size, 7 * tile_size, 3), dtype=np.uint8))
-
+            # Model prediction (strictly deterministic for consistent feature extraction)
             action, _ = model.predict(obs, deterministic=True)
-            obs_tensor = torch.as_tensor(obs).float().to(model.device)
-            features = model.policy.features_extractor(obs_tensor)
+            obs_tensor, _ = model.policy.obs_to_tensor(obs)
+            
+            # Safely extract latent features from the CNN policy
+            features = model.policy.extract_features(obs_tensor, model.policy.features_extractor)
+            
             features_list.append(features.cpu())
             actions_list.append(torch.tensor(action))
+            
             obs, rewards, dones, infos = env.step(action)
+            
             if dones[0]:
                 episode_count += 1
                 pbar.update(1)
-                obs = env.reset()
+                
         pbar.close()
 
     env.close()
 
+    # 3. AGGREGATE DATA
     features = torch.cat(features_list, dim=0)
     actions = torch.cat(actions_list, dim=0)
+    
     observations = torch.tensor(np.stack(obs_grid_list))
-    observations_pixel = torch.tensor(np.stack(obs_pixel_list))
+    
+    try:
+        observations_pixel = torch.tensor(np.stack(obs_pixel_list))
+    except ValueError:
+        print("Warning: Pixel observations have inconsistent shapes. Returning raw list.")
+        observations_pixel = obs_pixel_list
 
     print(f"Collected {len(features)} samples, feature dim = {features.shape[1]}")
-    print(f"  Grid observations: {observations.shape}")
-    print(f"  Pixel observations: {observations_pixel.shape}")
-
+    
     return features, actions, observations, observations_pixel
 
 
@@ -282,7 +280,7 @@ def collect_features(model_path, env_name, n_episodes=800, seed=42, tile_size=8)
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_stage1(features: torch.Tensor, actions: torch.Tensor,
+def run_stage1(features: torch.Tensor, actions: torch.Tensor, env_name: str,
                save_dir: str = "./stage1_outputs"):
     X = features.numpy()
     A = actions.numpy().astype(int)
@@ -293,14 +291,14 @@ def run_stage1(features: torch.Tensor, actions: torch.Tensor,
     print(f"{'#'*60}")
 
     norm_stats = compute_normalization_stats(X)
-    action_stats = action_distribution_analysis(A)
+    action_stats = action_distribution_analysis(A, env_name)
     plot_diagnostics(norm_stats, action_stats, save_dir)
     save_path = save_stage1_outputs(norm_stats, action_stats, save_dir)
 
     print(f"\n{'='*60}")
     print(f"RECOMMENDATIONS FOR STAGE 2 (SAE TRAINING)")
     print(f"{'='*60}")
-    print(f"  → Normalize features with saved mean/std before SAE training")
+    print(f"  → Normalize features with saved mean/std before SAE training\n")
 
     return load_stage1_outputs(save_path)
 
@@ -310,16 +308,16 @@ def run_stage1(features: torch.Tensor, actions: torch.Tensor,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 1: Feature Space Analysis (No SVD/ICA)")
+    parser = argparse.ArgumentParser(description="Stage 1: Feature Space Analysis (Multi-env Support)")
     parser.add_argument("--features_path", type=str, default=None,
-                        help="Path to pre-collected features .pt file (with 'features' and 'actions' keys)")
+                        help="Path to pre-collected features .pt file")
     parser.add_argument("--model_path", type=str, default="ppo_doorkey_6x6.zip",
-                        help="PPO model path (used if --features_path not given)")
+                        help="PPO model path")
     parser.add_argument("--env_name", type=str, default="MiniGrid-DoorKey-6x6-v0",
-                        help="Environment name (used if --features_path not given)")
+                        help="Environment name (MiniGrid, PixelCartPole-v0, PongNoFrameskip-v4, etc.)")
     parser.add_argument("--n_episodes", type=int, default=800,
                         help="Number of episodes to collect")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save_dir", type=str, default="./stage1_outputs")
 
     args = parser.parse_args()
@@ -335,20 +333,16 @@ def main():
         )
         os.makedirs(args.save_dir, exist_ok=True)
         raw_path = os.path.join(args.save_dir, "collected_data.pt")
+        
         torch.save({
             "features": features,
             "actions": actions,
-            "observations": observations,            # grid encoding (for dedup)
-            "observations_pixel": observations_pixel, # MiniGrid rendered (for display)
+            "observations": observations if isinstance(observations, torch.Tensor) else None,
+            "observations_pixel": observations_pixel if isinstance(observations_pixel, torch.Tensor) else None,
         }, raw_path)
-        print(f"Raw data saved: {raw_path}")
-        print(f"  Grid obs: {observations.shape}")
-        print(f"  Pixel obs: {observations_pixel.shape}")
+        print(f"\nRaw data saved: {raw_path}")
 
-    stage1_data = run_stage1(
-        features, actions,
-        save_dir=args.save_dir,
-    )
+    run_stage1(features, actions, env_name=args.env_name, save_dir=args.save_dir)
 
 
 if __name__ == "__main__":

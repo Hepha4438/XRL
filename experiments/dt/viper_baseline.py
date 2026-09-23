@@ -10,18 +10,25 @@ ACTUAL VIPER IMPLEMENTATION:
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import joblib
 import numpy as np
 import torch
+
+import ale_py
 import gymnasium as gym
+gym.register_envs(ale_py)
+
 import minigrid
 import stable_baselines3
+from minigrid.wrappers import ImgObsWrapper
 from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_atari_env
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, VecFrameStack
 from sklearn.metrics import accuracy_score
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import train_test_split
@@ -50,8 +57,8 @@ def parse_args() -> argparse.Namespace:
                         help="Minimum samples per leaf to prevent overfitting.")
     parser.add_argument("--n_eval_episodes", type=int, default=1000,
                         help="Number of episodes for the FINAL rigorous evaluation.")
-    parser.add_argument("--max_steps", type=int, default=500,
-                        help="Max steps per episode (determines success in CartPole).")
+    parser.add_argument("--max_steps", type=int, default=27000,
+                        help="Max steps per episode (27000 recommended for Atari).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--only-test", action="store_true",
                         help="Skip DAgger training and only load/test existing model.")
@@ -79,9 +86,8 @@ class DTAgent:
     def predict(self, obs: np.ndarray) -> np.ndarray:
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs).float().to(self.device)
-            features = self.ppo_model.policy.features_extractor(obs_tensor)
+            features = self.ppo_model.policy.extract_features(obs_tensor, self.ppo_model.policy.features_extractor)
         
-        # Scikit-learn expects 2D array: (batch_size, features_dim)
         action = self.dt_model.predict(features.cpu().numpy())
         return action
 
@@ -95,42 +101,52 @@ class PPOTeacherAgent:
         return action
 
 
+def make_eval_env(env_name: str, seed: int = 42):
+    """Universal Environment Factory for Atari, MiniGrid, and CartPole."""
+    is_atari = "NoFrameskip" in env_name or "Boxing" in env_name or "Pong" in env_name
+    is_minigrid = "MiniGrid" in env_name
+
+    if is_atari:
+        env = make_atari_env(env_name, n_envs=1, seed=seed, wrapper_kwargs={"clip_reward": False})
+        env = VecFrameStack(env, n_stack=4)
+        return VecTransposeImage(env)
+    elif is_minigrid:
+        def _init():
+            e = gym.make(env_name, render_mode="rgb_array")
+            e = ImgObsWrapper(e)
+            e.reset(seed=seed)
+            return e
+        env = DummyVecEnv([_init])
+        return VecTransposeImage(env)
+    else:
+        def _init():
+            import sys
+            sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+            from utils_env import make_env_by_name
+            return make_env_by_name(env_name, render_mode="rgb_array", seed=seed)
+        env = DummyVecEnv([_init])
+        if len(env.observation_space.shape) == 3:
+            env = VecTransposeImage(env)
+        return env
+
+
 # ============================================================================
 # CORE VIPER LOGIC (DAgger + Labeling + Weighting)
 # ============================================================================
 
 def query_teacher(ppo_model: PPO, obs: np.ndarray, device: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Passes observations through the Teacher to get:
-    1. Features (CNN output)
-    2. Best Action (Label)
-    3. Criticality Weight (Max Prob - Min Prob) for Cost-Sensitive Learning
-    """
     with torch.no_grad():
         obs_tensor = torch.as_tensor(obs).float().to(device)
-        
-        # 1. Get CNN Features
-        features = ppo_model.policy.features_extractor(obs_tensor)
-        
-        # 2. Forward through MLP to get Action Logits
+        features = ppo_model.policy.extract_features(obs_tensor, ppo_model.policy.features_extractor)
         latent_pi, _ = ppo_model.policy.mlp_extractor(features)
         logits = ppo_model.policy.action_net(latent_pi)
         probs = torch.softmax(logits, dim=-1)
-        
-        # 3. Label and Weight
         best_actions = logits.argmax(dim=-1).cpu().numpy()
-        
-        # Cost-sensitive weight: Difference between most likely and least likely action
         weights = (probs.max(dim=-1)[0] - probs.min(dim=-1)[0]).cpu().numpy()
-        
     return features.cpu().numpy(), best_actions, weights
 
 
 def collect_rollouts(env, agent, teacher_ppo: PPO, n_episodes: int, device: str, max_steps: int):
-    """
-    Rollout the given agent in the environment. 
-    Regardless of who is playing (Teacher or Student), the data is ALWAYS labeled by the Teacher.
-    """
     all_features = []
     all_actions = []
     all_weights = []
@@ -141,14 +157,12 @@ def collect_rollouts(env, agent, teacher_ppo: PPO, n_episodes: int, device: str,
         ep_len = 0
         
         while not done and ep_len < max_steps:
-            # 1. Ask Teacher to analyze the current state
             feats, teacher_acts, weights = query_teacher(teacher_ppo, obs, device)
             
             all_features.append(feats[0])
             all_actions.append(teacher_acts[0])
             all_weights.append(weights[0])
             
-            # 2. Agent decides the next step
             action = agent.predict(obs)
             obs, _, dones, _ = env.step(action)
             
@@ -159,7 +173,6 @@ def collect_rollouts(env, agent, teacher_ppo: PPO, n_episodes: int, device: str,
 
 
 def evaluate_agent(env, agent, n_episodes: int, env_name: str, max_steps: int) -> Tuple[float, float, float]:
-    """Evaluation of an agent's success rate, return, and length."""
     successes = 0
     returns = []
     lengths = []
@@ -177,9 +190,14 @@ def evaluate_agent(env, agent, n_episodes: int, env_name: str, max_steps: int) -
             done = bool(dones[0])
             ep_len += 1
             
-        # Phân biệt tiêu chí thành công giữa CartPole và MiniGrid
+            if done and "episode" in infos[0]:
+                ep_return = float(infos[0]["episode"]["r"])
+            
+        is_atari = "NoFrameskip" in env_name or "Boxing" in env_name or "Pong" in env_name
         if "CartPole" in env_name:
             is_success = (ep_len >= max_steps)
+        elif is_atari:
+            is_success = ep_return > 0
         else:
             info = infos[0] if isinstance(infos, (list, tuple)) and len(infos) > 0 else (infos[0] if infos else {})
             is_success = bool(info.get("is_success", False)) or ep_return > 0
@@ -221,26 +239,18 @@ def calculate_tree_metrics(clf: DecisionTreeClassifier) -> Dict[str, Any]:
 
 
 def calculate_offline_action_fidelity(clf: DecisionTreeClassifier, data_path: str, ppo_model: PPO, device: str) -> Tuple[float, Dict[str, Any]]:
-    """
-    Calculate action fidelity on offline collected data (using test split).
-    Returns (action_fidelity, fidelity_metrics_dict)
-    """
     print(f"Loading offline collected data from {data_path}...")
     data = torch.load(data_path, weights_only=False)
     
-    # Extract features and labels
     if isinstance(data, dict):
         X = data["features"].numpy() if isinstance(data["features"], torch.Tensor) else data["features"]
         y = data["actions"].numpy() if isinstance(data["actions"], torch.Tensor) else data["actions"]
     else:
-        # Assuming tuple format (features, actions)
         X = data[0].numpy() if isinstance(data[0], torch.Tensor) else data[0]
         y = data[1].numpy() if isinstance(data[1], torch.Tensor) else data[1]
     
-    # Split into train/test (80/20)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Calculate fidelity on test split
     y_pred = clf.predict(X_test)
     action_fidelity = accuracy_score(y_test, y_pred)
     
@@ -260,17 +270,9 @@ def main() -> None:
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 1. Environment Setup
-    def _init():
-        import sys
-        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-        from utils_env import make_env_by_name
-        return make_env_by_name(args.env_name, seed=args.seed)
-        
-    env = VecTransposeImage(DummyVecEnv([_init]))
-    eval_env = VecTransposeImage(DummyVecEnv([_init])) 
+    env = make_eval_env(args.env_name, args.seed)
+    eval_env = make_eval_env(args.env_name, args.seed)
     
-    # 2. Load Teacher PPO
     print(f"Loading PPO Teacher from {args.ppo_path}...")
     try:
         ppo_teacher = PPO.load(args.ppo_path, device=device)
@@ -294,10 +296,8 @@ def main() -> None:
             "policy_kwargs": {"features_extractor_class": MinigridFeaturesExtractor, "features_extractor_kwargs": {"features_dim": 128}}
         })
 
-    # Only-test mode: load existing model
     if args.only_test:
         print(f"[Only-Test Mode] Loading existing VIPER model...")
-        # Use provided model_path if available, otherwise use save_dir
         if args.model_path:
             model_path = Path(args.model_path)
         else:
@@ -308,13 +308,11 @@ def main() -> None:
         best_clf = joblib.load(model_path)
         print(f"Loaded VIPER model from {model_path}")
         
-        # Calculate offline action fidelity
         if Path(args.data_path).exists():
             offline_af, fidelity_metrics = calculate_offline_action_fidelity(best_clf, args.data_path, ppo_teacher, device)
             print(f"\nAction Fidelity on Offline Data (test split): {offline_af:.4f}")
             print(f"  (Note: Model was trained on DAgger data, not offline data. Lower AF is expected.)")
             
-            # Save fidelity metrics
             metrics_path = save_dir / "viper_metrics_only_test.json"
             print(f"Saving only-test metrics to {metrics_path}...")
             with open(metrics_path, "w") as f:
@@ -322,12 +320,10 @@ def main() -> None:
         else:
             print(f"Warning: Data path {args.data_path} not found. Skipping offline action fidelity.")
     else:
-        # Training mode: DAgger with interactive learning
         print(f"Starting VIPER with DAgger. Device: {device}")
 
         teacher_agent = PPOTeacherAgent(ppo_teacher)
         
-        # 3. VIPER / DAgger Loop
         dataset_features = []
         dataset_actions = []
         dataset_weights = []
@@ -348,23 +344,19 @@ def main() -> None:
             print(f"VIPER ITERATION {i}/{args.n_dagger_iters}")
             print("="*50)
             
-            # A. Original VIPER Resampling Logic
             X = np.vstack(dataset_features)
             y = np.array(dataset_actions)
             w = np.array(dataset_weights)
             
-            # Normalize weights to form a probability distribution
             w_sum = np.sum(w)
             if w_sum > 0:
                 p = w / w_sum
             else:
-                p = np.ones_like(w) / len(w) # Fallback to uniform distribution
+                p = np.ones_like(w) / len(w)
                 
-            # Sample with replacement
             n_samples = len(y)
             print(f"  -> Resampling {n_samples} transitions based on Teacher's probability gap...")
             
-            # Set seed for reproducibility during resampling
             rng = np.random.default_rng(args.seed + i)
             indices = rng.choice(n_samples, size=n_samples, replace=True, p=p)
             
@@ -378,10 +370,8 @@ def main() -> None:
                 ccp_alpha=0.001,
                 random_state=args.seed + i,
             )
-            # Train normally without sample_weight (already accounted for via resampling)
             clf.fit(X_resampled, y_resampled) 
             
-            # B. Evaluate current Student
             student_agent = DTAgent(clf, ppo_teacher, device)
             eval_eps = 20
             print(f"  -> Evaluating Student on {eval_eps} episodes...")
@@ -393,7 +383,6 @@ def main() -> None:
                 best_clf = clf
                 print("  -> [*] New Best Model!")
                 
-            # C. Rollout Student to collect DAgger data
             if i < args.n_dagger_iters:
                 print(f"  -> Student exploring the environment to find edge cases...")
                 f, a, w = collect_rollouts(env, student_agent, ppo_teacher, args.episodes_per_iter, device, args.max_steps)
@@ -402,15 +391,12 @@ def main() -> None:
                 dataset_weights.extend(w)
                 print(f"  -> Added {len(a)} new samples to dataset.")
         
-        # Save model after training
         model_path = save_dir / "viper_policy.pkl"
         print(f"Saving best VIPER model to {model_path}...")
         joblib.dump(best_clf, model_path)
         
-        # Calculate metrics
         metrics = calculate_tree_metrics(best_clf)
         
-        # 1. DAgger-based action fidelity (what the model was trained on)
         X_full = np.vstack(dataset_features)
         y_full = np.array(dataset_actions)
         y_pred = best_clf.predict(X_full)
@@ -418,7 +404,6 @@ def main() -> None:
         metrics["Action Fidelity (DAgger Dataset)"] = float(dagger_af)
         print(f"\nAction Fidelity on DAgger Data (training dataset): {dagger_af:.4f}")
         
-        # 2. Offline action fidelity on collected_data.pt (for fair comparison with SA-DT/Soft-DT)
         if Path(args.data_path).exists():
             offline_af, fidelity_metrics = calculate_offline_action_fidelity(best_clf, args.data_path, ppo_teacher, device)
             metrics.update(fidelity_metrics)
@@ -432,23 +417,19 @@ def main() -> None:
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=4)
 
-    # Evaluation (only-test or post-training)
-    eval_env = VecTransposeImage(DummyVecEnv([_init]))
     print(f"Running evaluation on {args.n_eval_episodes} episodes...")
     
-    # Multi-seed evaluation
     if args.multi_seed:
         print(f"\nMulti-Seed Evaluation: Running on seeds [42,43,44,45,46] with {args.n_eval_episodes//5} episodes each...")
         eval_eps = args.n_eval_episodes // 5
         all_results = {}
         for seed in [42, 43, 44, 45, 46]:
             args.seed = seed
-            eval_env_seed = VecTransposeImage(DummyVecEnv([_init]))
+            eval_env_seed = make_eval_env(args.env_name, seed)
             student_agent = DTAgent(best_clf, ppo_teacher, device)
             success_rate, avg_return, avg_length = evaluate_agent(eval_env_seed, student_agent, eval_eps, args.env_name, args.max_steps)
             all_results[seed] = {"Success Rate": success_rate, "Avg Return": avg_return, "Avg Length": avg_length}
         
-        # Aggregate
         print(f"\n{'='*70}")
         print("MULTI-SEED AGGREGATED RESULTS")
         print(f"{'='*70}")
@@ -459,7 +440,6 @@ def main() -> None:
             print(f"{key:25s}: {mean_val:.4f} ± {std_val:.4f}")
         print(f"{'='*70}\n")
         
-        # Save multi-seed metrics
         if not args.only_test:
             metrics_multiseed_path = save_dir / "viper_metrics_multiseed.json"
             multiseed_summary = {}
@@ -474,7 +454,6 @@ def main() -> None:
             with open(metrics_multiseed_path, "w") as f:
                 json.dump(multiseed_summary, f, indent=4)
     else:
-        # Single-seed evaluation
         final_student = DTAgent(best_clf, ppo_teacher, device)
         final_success_rate, final_avg_return, final_avg_length = evaluate_agent(eval_env, final_student, args.n_eval_episodes, args.env_name, args.max_steps)
         

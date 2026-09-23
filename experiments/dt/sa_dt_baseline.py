@@ -9,19 +9,25 @@ Unlike VIPER, it does not use DAgger or cost-sensitive resampling.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict
 
 import joblib
 import numpy as np
 import torch
+
+import ale_py
 import gymnasium as gym
+gym.register_envs(ale_py)
+
 import minigrid
 import stable_baselines3
 from minigrid.wrappers import ImgObsWrapper
 from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_atari_env
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, VecFrameStack
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
@@ -74,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of episodes for game evaluation.",
     )
     parser.add_argument(
+        "--max_steps", 
+        type=int, 
+        default=27000, 
+        help="Max steps per episode (27000 recommended for Atari Pong/Boxing)."
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -99,34 +111,55 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def make_eval_env(env_name: str, seed: int = 42):
+    """Universal Environment Factory for Atari, MiniGrid, and CartPole."""
+    is_atari = "NoFrameskip" in env_name or "Boxing" in env_name or "Pong" in env_name
+    is_minigrid = "MiniGrid" in env_name
+
+    if is_atari:
+        env = make_atari_env(env_name, n_envs=1, seed=seed, wrapper_kwargs={"clip_reward": False})
+        env = VecFrameStack(env, n_stack=4)
+        return VecTransposeImage(env)
+    elif is_minigrid:
+        def _init():
+            e = gym.make(env_name, render_mode="rgb_array")
+            e = ImgObsWrapper(e)
+            e.reset(seed=seed)
+            return e
+        env = DummyVecEnv([_init])
+        return VecTransposeImage(env)
+    else:
+        def _init():
+            import sys
+            sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+            from utils_env import make_env_by_name
+            return make_env_by_name(env_name, render_mode="rgb_array", seed=seed)
+        env = DummyVecEnv([_init])
+        if len(env.observation_space.shape) == 3:
+            env = VecTransposeImage(env)
+        return env
+
+
 def calculate_tree_metrics(clf: DecisionTreeClassifier) -> Dict[str, Any]:
-    """
-    Calculate interpretability metrics from the scikit-learn DecisionTree.
-    """
+    """Calculate interpretability metrics from the scikit-learn DecisionTree."""
     tree = clf.tree_
     n_nodes = tree.node_count
     children_left = tree.children_left
     children_right = tree.children_right
 
-    # Rule Set Cardinality: The total number of leaf nodes in the tree
     rule_set_cardinality = clf.get_n_leaves()
-
-    # Binarized # Concepts: The total number of internal (non-leaf) nodes in the tree
     binarized_concepts = n_nodes - rule_set_cardinality
 
-    # Total Literals: Sum of the depths of all leaf nodes (via DFS)
     total_literals = 0
-    stack = [(0, 0)]  # (node_id, depth)
+    stack = [(0, 0)]  
 
     while stack:
         node_id, depth = stack.pop()
-
         is_split_node = children_left[node_id] != -1
         if is_split_node:
             stack.append((children_left[node_id], depth + 1))
             stack.append((children_right[node_id], depth + 1))
         else:
-            # We reached a leaf node
             total_literals += depth
 
     metrics = {
@@ -149,9 +182,7 @@ class SADTAgent:
     def predict(self, obs: np.ndarray) -> np.ndarray:
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs).float().to(self.device)
-            # PPO CNN feature extractor
-            features = self.ppo_model.policy.features_extractor(obs_tensor)
-            
+            features = self.ppo_model.policy.extract_features(obs_tensor, self.ppo_model.policy.features_extractor)
         action = self.dt_model.predict(features.cpu().numpy())
         return action
 
@@ -160,9 +191,10 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
     """Evaluate the DecisionTreeClassifier directly in the Gym Environment."""
     print(f"\nEvaluating SA-DT policy on {args.n_eval_episodes} episodes of {args.env_name}...")
     
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     try:
-        # Load the base model
-        ppo_model = PPO.load(args.ppo_path, device="cpu")
+        ppo_model = PPO.load(args.ppo_path, device=device)
     except Exception as e:
         print(f"Standard PPO load failed, retrying with custom feature extractors (error: {e})")
         import torch.nn as nn
@@ -201,18 +233,10 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
                 "net_arch": {"pi": [128, 128], "vf": [128, 128]},
             }
         }
-        ppo_model = PPO.load(args.ppo_path, device="cpu", custom_objects=custom_objects)
+        ppo_model = PPO.load(args.ppo_path, device=device, custom_objects=custom_objects)
         
-    def _init():
-        import sys
-        import os
-        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-        from utils_env import make_env_by_name
-        return make_env_by_name(args.env_name, seed=args.seed)
-        
-    env = VecTransposeImage(DummyVecEnv([_init]))
-    env.seed(args.seed)
-    agent = SADTAgent(dt_model, ppo_model, "cpu")
+    env = make_eval_env(args.env_name, args.seed)
+    agent = SADTAgent(dt_model, ppo_model, device)
     
     successes = 0
     returns = []
@@ -224,15 +248,25 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
         ep_return = 0.0
         ep_len = 0
         
-        while not done and ep_len < 1000:
+        while not done and ep_len < args.max_steps:
             action = agent.predict(obs)
             obs, rewards, dones, infos = env.step(action)
             ep_return += float(rewards[0])
             ep_len += 1
             done = bool(dones[0])
+
+            if done and "episode" in infos[0]:
+                ep_return = float(infos[0]["episode"]["r"])
             
-        info = infos[0] if isinstance(infos, (list, tuple)) and len(infos) > 0 else (infos[0] if infos else {})
-        is_success = bool(info.get("is_success", False)) or ep_return > 0
+        is_atari = "NoFrameskip" in args.env_name or "Boxing" in args.env_name or "Pong" in args.env_name
+        if "CartPole" in args.env_name:
+            is_success = (ep_len >= args.max_steps)
+        elif is_atari:
+            is_success = ep_return > 0
+        else:
+            info = infos[0] if isinstance(infos, (list, tuple)) and len(infos) > 0 else (infos[0] if infos else {})
+            is_success = bool(info.get("is_success", False)) or ep_return > 0
+            
         if is_success:
             successes += 1
             
@@ -251,15 +285,11 @@ def evaluate_on_env(dt_model: DecisionTreeClassifier, args: argparse.Namespace) 
 def main() -> None:
     args = parse_args()
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # Only-test mode: load existing model
     if args.only_test:
         print(f"[Only-Test Mode] Loading existing model...")
-        # Use provided model_path if available, otherwise use save_dir
         if args.model_path:
             model_path = Path(args.model_path)
         else:
@@ -270,7 +300,6 @@ def main() -> None:
         clf = joblib.load(model_path)
         print(f"Loaded SA-DT model from {model_path}")
     else:
-        # Training mode
         print(f"Loading data from {args.data_path}...")
         data = torch.load(args.data_path, map_location="cpu", weights_only=False)
 
@@ -290,13 +319,11 @@ def main() -> None:
 
         print(f"Features shape: {features_np.shape}, Actions shape: {actions_np.shape}")
 
-        # 2. Preprocess
         print("Splitting data into train/test sets...")
         X_train, X_test, y_train, y_test = train_test_split(
             features_np, actions_np, test_size=0.20, random_state=42
         )
 
-        # 3. Model Training
         print("Training State-Action Decision Tree (SA-DT)...")
         clf = DecisionTreeClassifier(
             max_depth=args.max_depth,
@@ -305,7 +332,6 @@ def main() -> None:
         )
         clf.fit(X_train, y_train)
 
-        # 4. Metrics Calculation
         print("Calculating metrics...")
         y_pred = clf.predict(X_test)
         action_fidelity = accuracy_score(y_test, y_pred)
@@ -313,7 +339,6 @@ def main() -> None:
         metrics = calculate_tree_metrics(clf)
         metrics["Action Fidelity"] = float(action_fidelity)
 
-        # Save model
         model_path = save_dir / "sa_dt_policy.pkl"
         print(f"Saving model to {model_path}...")
         joblib.dump(clf, model_path)
@@ -323,11 +348,9 @@ def main() -> None:
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=4)
 
-    # Game Evaluation (Online rollout)
     print("Evaluating on environment...")
     game_metrics = evaluate_on_env(clf, args)
 
-    # Multi-seed evaluation
     if args.multi_seed:
         print(f"\nMulti-Seed Evaluation: Running on seeds [42,43,44,45,46] with {args.n_eval_episodes//5} episodes each...")
         all_results = {}
@@ -336,7 +359,6 @@ def main() -> None:
             game_metrics = evaluate_on_env(clf, args)
             all_results[seed] = game_metrics
         
-        # Aggregate
         print(f"\n{'='*70}")
         print("MULTI-SEED AGGREGATED RESULTS")
         print(f"{'='*70}")
@@ -347,7 +369,6 @@ def main() -> None:
             print(f"{key:25s}: {mean_val:.4f} ± {std_val:.4f}")
         print(f"{'='*70}\n")
         
-        # Save multi-seed metrics
         if not args.only_test:
             metrics_multiseed_path = save_dir / "sa_dt_metrics_multiseed.json"
             multiseed_summary = {}
@@ -362,7 +383,6 @@ def main() -> None:
             with open(metrics_multiseed_path, "w") as f:
                 json.dump(multiseed_summary, f, indent=4)
     else:
-        # Single-seed evaluation (original logic)
         print("\n--- Metrics ---")
         if not args.only_test:
             metrics = {"Game Avg Return": game_metrics.get("Game Avg Return"), "Game Avg Length": game_metrics.get("Game Avg Length")}

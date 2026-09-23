@@ -1,83 +1,48 @@
 #!/usr/bin/env python3
 """
-Quick evaluator for PPO DoorKey 6x6 checkpoint.
+Quick evaluator for PPO Atari Boxing checkpoint.
 
 Usage:
-  python test_ppo_doorkey_6x6.py \
-      --model_path ppo_doorkey_6x6.zip \
-      --env_name MiniGrid-DoorKey-6x6-v0 \
+  python test_boxing.py \
+      --model_path runs/boxing_s0/final_model \
+      --env_name BoxingNoFrameskip-v4 \
       --n_episodes 50
 """
 
 import argparse
-
-import gymnasium as gym
-import minigrid  # noqa: F401
 import numpy as np
 import torch
-import torch.nn as nn
-from minigrid.wrappers import ImgObsWrapper
+
+import ale_py
+import gymnasium as gym
+gym.register_envs(ale_py)
+
 from stable_baselines3 import PPO
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
-
-
-class MinigridFeaturesExtractor(BaseFeaturesExtractor):
-    """Feature extractor matching the architecture used during 6x6 training."""
-
-    def __init__(self, observation_space: gym.Space, features_dim: int = 128):
-        super().__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-        with torch.no_grad():
-            sample = torch.as_tensor(observation_space.sample()[None]).float()
-            n_flatten = self.cnn(sample).shape[1]
-
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.cnn(observations.float()))
+from stable_baselines3.common.env_util import make_atari_env
+from stable_baselines3.common.vec_env import VecFrameStack, VecTransposeImage
 
 
 def make_vec_env(env_name: str, seed: int = 42):
-    def _make():
-        def _init():
-            env = gym.make(env_name)
-            env = ImgObsWrapper(env)
-            env.reset(seed=seed)
-            env.action_space.seed(seed)
-            return env
-
-        return _init
-
-    env = DummyVecEnv([_make()])
-    env.seed(seed)
+    """
+    Tạo môi trường chuẩn cho Atari giống lúc train:
+    - make_atari_env (NoFrameskip, wrapper mặc định của SB3 cho Atari)
+    - VecFrameStack (gom 4 frames)
+    - VecTransposeImage (chuyển channel HWC sang CHW cho PyTorch)
+    """
+    env = make_atari_env(env_name, n_envs=1, seed=seed)
+    env = VecFrameStack(env, n_stack=4)
     return VecTransposeImage(env)
 
 
 def load_model(model_path: str, device: str):
-    # Override policy_kwargs to avoid old cloudpickle incompatibilities.
-    custom_objects = {
-        "policy_kwargs": {
-            "features_extractor_class": MinigridFeaturesExtractor,
-            "features_extractor_kwargs": {"features_dim": 128},
-            "net_arch": {"pi": [128, 128], "vf": [128, 128]},
-        }
-    }
-    return PPO.load(model_path, device=device, custom_objects=custom_objects)
+    """
+    Load PPO model. Không cần custom_objects vì model dùng CnnPolicy mặc định của SB3.
+    """
+    # Nếu file .zip không có đuôi, tự động thêm để SB3 không bị lỗi
+    if not model_path.endswith('.zip') and not os.path.exists(model_path) and os.path.exists(model_path + '.zip'):
+        model_path += '.zip'
+        
+    return PPO.load(model_path, device=device)
 
 
 def evaluate(model: PPO, env, n_episodes: int, max_steps: int, deterministic: bool):
@@ -98,8 +63,9 @@ def evaluate(model: PPO, env, n_episodes: int, max_steps: int, deterministic: bo
             ep_len += 1
             done = bool(dones[0])
 
-        info = infos[0] if infos else {}
-        is_success = bool(info.get("is_success", False)) or ep_return > 0
+        # Trong Atari Boxing, không có cờ "is_success".
+        # Ta quy ước "Success" là điểm tổng > 0 (bạn đánh trúng nhiều hơn bị đánh)
+        is_success = ep_return > 0
         if is_success:
             successes += 1
 
@@ -114,11 +80,13 @@ def evaluate(model: PPO, env, n_episodes: int, max_steps: int, deterministic: bo
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test PPO DoorKey 6x6 model")
-    parser.add_argument("--model_path", type=str, default="ppo_doorkey_6x6.zip")
-    parser.add_argument("--env_name", type=str, default="MiniGrid-DoorKey-6x6-v0")
-    parser.add_argument("--n_episodes", type=int, default=1000)
-    parser.add_argument("--max_steps", type=int, default=100)
+    parser = argparse.ArgumentParser(description="Test PPO Atari Boxing model")
+    # Thay đổi default mặc định về config của Boxing
+    parser.add_argument("--model_path", type=str, default="runs/boxing_s0/final_model")
+    parser.add_argument("--env_name", type=str, default="BoxingNoFrameskip-v4")
+    parser.add_argument("--n_episodes", type=int, default=10)
+    # 10000 step là đủ dài cho 1 game Atari
+    parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--deterministic", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
@@ -128,6 +96,7 @@ def parse_args():
 
 
 def main():
+    import os
     args = parse_args()
 
     print(f"Loading model: {args.model_path}")
@@ -136,7 +105,7 @@ def main():
     if args.multi_seed:
         # Multi-seed evaluation on 5 seeds
         seeds = [42, 43, 44, 45, 46]
-        episodes_per_seed = args.n_episodes // 5
+        episodes_per_seed = max(1, args.n_episodes // 5)
         all_results = {}
 
         print(f"\nMulti-Seed Evaluation: Running on seeds {seeds} with {episodes_per_seed} episodes each")
@@ -170,9 +139,9 @@ def main():
         avg_returns = [all_results[s]["return"] for s in seeds]
         avg_lengths = [all_results[s]["length"] for s in seeds]
 
-        print(f"Success Rate    : {np.mean(success_rates):.4f} ± {np.std(success_rates):.4f} %")
-        print(f"Avg Return      : {np.mean(avg_returns):.4f} ± {np.std(avg_returns):.4f}")
-        print(f"Avg Ep Length   : {np.mean(avg_lengths):.4f} ± {np.std(avg_lengths):.4f}")
+        print(f"Win Rate (Score > 0): {np.mean(success_rates):.4f} ± {np.std(success_rates):.4f} %")
+        print(f"Avg Return          : {np.mean(avg_returns):.4f} ± {np.std(avg_returns):.4f}")
+        print(f"Avg Ep Length       : {np.mean(avg_lengths):.4f} ± {np.std(avg_lengths):.4f}")
         print(f"{'='*70}\n")
     else:
         # Single-seed evaluation
@@ -201,7 +170,7 @@ def main():
 
         print("\nRESULTS")
         print("=" * 50)
-        print(f"Success         : {successes}/{args.n_episodes} ({100.0 * successes / args.n_episodes:.2f}%)")
+        print(f"Win (Score > 0) : {successes}/{args.n_episodes} ({100.0 * successes / args.n_episodes:.2f}%)")
         print(f"Avg return      : {returns.mean():.4f} +/- {returns.std():.4f}")
         print(f"Avg ep length   : {lengths.mean():.4f} +/- {lengths.std():.4f}")
 

@@ -4,22 +4,13 @@ SAE + Product T-Norm Neural Logic Training (JOINT TRAINING BASELINE)
 This is an ablation study baseline demonstrating the "Gradient War" 
 phenomenon where the SAE and logic layer are trained simultaneously 
 from scratch.
-
-Usage:
-    python train_joint.py \
-        --features_path ./stage1_outputs/collected_data.pt \
-        --hidden_dim 300 --k 50 \
-        --n_clauses_per_action 10 \
-        --n_epochs 400 \
-        --save_dir ./sae_logic_joint_outputs \
-        --entropy_weight 0.05
 """
 
 import argparse
 import json
 import os
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -96,7 +87,9 @@ class ProductTNormLogicLayer(nn.Module):
         log_literals = torch.log(literals + 1e-8)
         log_clause_sum = log_literals.sum(dim=-1)
 
-        clauses = torch.sigmoid(log_clause_sum + self.clause_weight.unsqueeze(0))
+        # Clamping bias to prevent the network from overriding logic penalties
+        clipped_bias = torch.clamp(self.clause_weight, max=5.0)
+        clauses = torch.sigmoid(log_clause_sum + clipped_bias.unsqueeze(0))
         clauses = clauses.view(batch_size, self.n_actions, self.n_clauses_per_action)
         return clauses.sum(dim=-1)
 
@@ -105,14 +98,8 @@ class ProductTNormLogicLayer(nn.Module):
         return self.l0_penalty_weight * (p + n).mean()
 
     def entropy_penalty(self) -> torch.Tensor:
-        """
-        [MỚI] Ép cụm (p, n, absent) về dạng one-hot 
-        (chỉ 1 giá trị xấp xỉ 1, các giá trị còn lại xấp xỉ 0)
-        """
         p, n = self._get_selection_probs()
-        a = 1.0 - p - n # Xác suất bỏ qua (absent)
-        
-        # Thêm 1e-8 để tránh lỗi log(0)
+        a = 1.0 - p - n 
         entropy = - (p * torch.log(p + 1e-8) + n * torch.log(n + 1e-8) + a * torch.log(a + 1e-8))
         return entropy.sum()
 
@@ -124,7 +111,9 @@ class ProductTNormLogicLayer(nn.Module):
 
         p, n = self._get_selection_probs()
         p, n = p.detach().cpu().numpy(), n.detach().cpu().numpy()
-        cb = self.clause_weight.detach().cpu().numpy()
+        
+        # Ensure extracted rules reflect the clamped bias
+        cb = torch.clamp(self.clause_weight, max=5.0).detach().cpu().numpy()
 
         rules = {}
         for a in range(self.n_actions):
@@ -132,41 +121,28 @@ class ProductTNormLogicLayer(nn.Module):
             for c in range(self.n_clauses_per_action):
                 idx = a * self.n_clauses_per_action + c
                 lits = []
+                is_false = False
+                
                 for i in range(self.n_features):
-                    if p[idx, i] > threshold:
+                    # Logical Contradiction: Feature cannot be both True and False simultaneously
+                    if p[idx, i] > threshold and n[idx, i] > threshold:
+                        is_false = True
+                        break
+                    elif p[idx, i] > threshold:
                         lits.append(f"{feature_names[i]}")
                     elif n[idx, i] > threshold:
                         lits.append(f"¬{feature_names[i]}")
-                if lits:
+                
+                if is_false:
+                    clauses.append(f"(False) [bias={cb[idx]:.2f}]")
+                elif lits:
                     clauses.append(f"({' ∧ '.join(lits)}) [bias={cb[idx]:.2f}]")
-            rules[action_names[a]] = clauses if clauses else ["(no active clauses)"]
+                else:
+                    # Universal Truth: All features are bypassed (a > threshold)
+                    clauses.append(f"(True) [bias={cb[idx]:.2f}]")
+                    
+            rules[action_names[a]] = clauses
         return rules
-
-    def count_active_rules(self, threshold=0.3, action_names=None):
-        if action_names is None:
-            action_names = [f"action_{a}" for a in range(self.n_actions)]
-        p, n = self._get_selection_probs()
-        p, n = p.detach().cpu().numpy(), n.detach().cpu().numpy()
-
-        total_clauses = non_empty = total_literals = 0
-        per_action = {}
-        for a in range(self.n_actions):
-            ac = 0
-            for c in range(self.n_clauses_per_action):
-                idx = a * self.n_clauses_per_action + c
-                nl = ((p[idx] > threshold) | (n[idx] > threshold)).sum()
-                total_clauses += 1
-                if nl > 0:
-                    non_empty += 1
-                    total_literals += nl
-                    ac += 1
-            per_action[action_names[a]] = ac
-        return {
-            'total_clauses': total_clauses,
-            'non_empty_clauses': non_empty,
-            'avg_literals_per_clause': total_literals / max(non_empty, 1),
-            'clauses_per_action': per_action,
-        }
 
 
 # ============================================================================
@@ -178,7 +154,7 @@ class SAELogicConfig:
     input_dim: int = 128
     hidden_dim: int = 256
     k: int = 10
-    n_actions: int = 7
+    n_actions: int = 7  
     initial_alpha: float = 1.0
     n_clauses_per_action: int = 10
     l0_penalty_weight: float = 1e-4
@@ -186,21 +162,18 @@ class SAELogicConfig:
     beta_action: float = 5.0
     lambda_bimodal: float = 0.0
     bimodal_max: float = 0.3
-    bimodal_warmup: int = 30  # epochs into Logic training
+    bimodal_warmup: int = 30  
     bimodal_ramp: int = 80
     
-    # [MỚI] Trọng số mục tiêu cho hàm Entropy (Sẽ scale dần từ 0 lên entropy_weight)
     entropy_weight: float = 0.005
 
-    action_class_weights: tuple = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    action_class_weights: Tuple[float, ...] = ()
 
-    # SAE pre-training components, retained for joint loss
     sae_lr: float = 1e-3
     lambda_sparsity: float = 5e-3
     alpha_recon: float = 1.0  
 
-    # Logic training
-    n_epochs: int = 400  # total epochs
+    n_epochs: int = 400
     batch_size: int = 256
     logic_lr: float = 3e-3
     bottleneck_lr: float = 1e-3
@@ -210,6 +183,7 @@ class SAELogicConfig:
     use_ica_init: bool = True
     log_every: int = 10
     save_dir: str = "./sae_logic_joint_outputs"
+    hard_threshold: float = 0.66
 
 
 # ============================================================================
@@ -303,7 +277,7 @@ def train_logic(model, train_loader, val_loader, config, device):
     class_weights = torch.tensor(config.action_class_weights, dtype=torch.float32, device=device)
 
     best_val_acc = 0.0
-    best_loss = float('inf')  # Dùng để tie-break khi Accuracy bằng nhau
+    best_loss = float('inf') 
     best_model_state = None
     history = []
 
@@ -312,7 +286,9 @@ def train_logic(model, train_loader, val_loader, config, device):
         train_info = []
 
         for batch_x, batch_a in train_loader:
-            batch_x, batch_a = batch_x.to(device), batch_a.to(device)
+            batch_x = batch_x.to(device)
+            batch_a = batch_a.long().view(-1).to(device)
+            
             action_logits, features = model.forward(batch_x, return_features=True)
 
             action_loss = F.cross_entropy(action_logits, batch_a, weight=class_weights)
@@ -363,7 +339,6 @@ def train_logic(model, train_loader, val_loader, config, device):
         avg.update({'val_acc': val_acc, 'epoch': epoch_idx})
         history.append(avg)
 
-        # --- LOGIC CẬP NHẬT BEST MODEL ---
         is_better_acc = val_acc > best_val_acc
         is_same_acc_but_lower_loss = (val_acc == best_val_acc) and (avg['total_loss'] < best_loss)
 
@@ -390,7 +365,7 @@ def train_logic(model, train_loader, val_loader, config, device):
 
         if (epoch_idx + 1) % 100 == 0:
             checkpoint_path = os.path.join(config.save_dir, f"sae_logic_joint_model_epoch_{epoch_idx+1}.pt")
-            rules = model.logic_layer.extract_rules(threshold=0.3)
+            rules = model.logic_layer.extract_rules(threshold=args.threshold)
             torch.save({
                 'model_state': model.state_dict(),
                 'config': asdict(config),
@@ -414,7 +389,8 @@ def evaluate(model, loader, device):
     correct = total = 0
     with torch.no_grad():
         for batch_x, batch_a in loader:
-            batch_x, batch_a = batch_x.to(device), batch_a.to(device)
+            batch_x = batch_x.to(device)
+            batch_a = batch_a.long().view(-1).to(device)
             logits = model(batch_x)
             correct += (logits.argmax(1) == batch_a).sum().item()
             total += batch_a.size(0)
@@ -427,9 +403,10 @@ def per_class_accuracy(model, loader, device, action_names):
     with torch.no_grad():
         for batch_x, batch_a in loader:
             batch_x = batch_x.to(device)
+            batch_a = batch_a.long().view(-1).to(device)
             logits = model(batch_x)
             all_preds.append(logits.argmax(1).cpu())
-            all_labels.append(batch_a)
+            all_labels.append(batch_a.cpu())
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
 
@@ -459,6 +436,7 @@ def linear_probe(model, train_loader, val_loader, device, n_epochs=50, lr=1e-3):
         with torch.no_grad():
             for bx, ba in loader:
                 bx = bx.to(device)
+                ba = ba.long().view(-1)
                 z_sparse, _ = model.sae.encode(bx)
                 z_normed = model.normalize_z(z_sparse)
                 z_bin = model.bottleneck(z_normed)
@@ -528,7 +506,6 @@ def plot_training_history(history, save_dir):
     ax.set_xlabel('Epoch'); ax.set_ylabel('Fraction near {0,1}')
     ax.set_title('Bottleneck Binarization'); ax.set_ylim(0, 1.05); ax.grid(True, alpha=0.3)
 
-    # Cập nhật Plot để biểu diễn cả Bimodality và Entropy
     ax = axes[1, 0]
     ax.plot(epochs, [h['bimodal_loss'] for h in history], label='Bimodal Weighted', linewidth=2)
     ax.plot(epochs, [h['logic_entropy'] for h in history], label='Entropy Penalty', linewidth=2, color='orange')
@@ -567,8 +544,39 @@ def main(args):
     print("\nLoading data...")
     data = torch.load(args.features_path, weights_only=False)
     features = data['features']
-    actions = data['actions']
+    actions = data['actions'].long().view(-1)
+    
     print(f"  Raw features: {features.shape}, range=[{features.min():.2f}, {features.max():.2f}]")
+
+    # Environment-based Action Labelling
+    if "Pong" in args.env_name:
+        n_actions = 6
+        action_names = ["NOOP", "FIRE", "RIGHT", "LEFT", "RIGHTFIRE", "LEFTFIRE"]
+    elif "MiniGrid" in args.env_name:
+        n_actions = 7
+        action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
+    elif "CartPole" in args.env_name:
+        n_actions = 2
+        action_names = ["Left", "Right"]
+    elif "Boxing" in args.env_name:
+        n_actions = 18
+        action_names = ["NOOP", "FIRE", "UP", "RIGHT", "LEFT", "DOWN", "UPRIGHT", "UPLEFT", 
+                        "DOWNRIGHT", "DOWNLEFT", "UPFIRE", "RIGHTFIRE", "LEFTFIRE", "DOWNFIRE", 
+                        "UPRIGHTFIRE", "UPLEFTFIRE", "DOWNRIGHTFIRE", "DOWNLEFTFIRE"]
+    else:
+        # Fallback to auto-detection if no matching env_name is provided
+        n_actions = args.n_actions if args.n_actions > 0 else int(actions.max().item()) + 1
+        action_names = [f"Action_{i}" for i in range(n_actions)]
+
+    actions = torch.clamp(actions, min=0, max=n_actions - 1)
+    print(f"  Configured Number of Actions: {n_actions}")
+
+    if args.action_class_weights is None:
+        action_class_weights = tuple(1.0 for _ in range(n_actions))
+    else:
+        assert len(args.action_class_weights) == n_actions, \
+            f"Expected {n_actions} class weights, but got {len(args.action_class_weights)}"
+        action_class_weights = tuple(args.action_class_weights)
 
     stage1_data = None
     if args.stage1_path and os.path.exists(args.stage1_path):
@@ -612,14 +620,12 @@ def main(args):
                 save_dict['observations'] = torch.tensor(obs)
         torch.save(save_dict, training_data_path)
 
-    action_names = ["TurnLeft", "TurnRight", "Forward", "Pickup", "Drop", "Toggle", "Done"]
-
     # --- Config ---
     config = SAELogicConfig(
         input_dim=features.shape[1],
         hidden_dim=args.hidden_dim,
         k=args.k,
-        n_actions=len(action_names),
+        n_actions=n_actions, 
         n_clauses_per_action=args.n_clauses_per_action,
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,
@@ -634,10 +640,11 @@ def main(args):
         sae_lr=args.sae_lr,
         logic_lr=args.logic_lr,
         bottleneck_lr=args.bottleneck_lr,
-        action_class_weights=tuple(args.action_class_weights),
+        action_class_weights=action_class_weights, 
         max_grad_norm=args.max_grad_norm,
         beta_action=args.beta_action,
-        entropy_weight=args.entropy_weight, # Khởi tạo trọng số Entropy
+        entropy_weight=args.entropy_weight,
+        hard_threshold=args.hard_threshold,
     )
 
     # --- Model ---
@@ -717,6 +724,13 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=50)
     parser.add_argument("--n_clauses_per_action", type=int, default=10)
 
+    # [NEW] Environment Name required to map correct action labels
+    parser.add_argument("--env_name", type=str, default="", 
+                        help="Environment Name (e.g., MiniGrid, Pong, Boxing). Used for correct action labeling.")
+
+    parser.add_argument("--n_actions", type=int, default=-1, 
+                        help="Force a specific number of actions. Leave -1 to auto-detect from data.")
+
     parser.add_argument("--n_epochs", type=int, default=400)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
@@ -731,24 +745,35 @@ if __name__ == "__main__":
     parser.add_argument("--bimodal_ramp", type=int, default=80)
 
     parser.add_argument("--l0_penalty", type=float, default=1e-4)
-    # [MỚI] Cho phép tuỳ chỉnh Entropy Weight tối đa qua terminal
     parser.add_argument("--entropy_weight", type=float, default=0.005,
                         help="Maximum weight for the entropy penalty")
     parser.add_argument("--lambda_sparsity", type=float, default=5e-3)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
 
     parser.add_argument("--save_dir", type=str, default="./sae_logic_joint_outputs")
+    
     parser.add_argument(
-        "--action_class_weights", type=float, nargs=7,
-        default=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "--action_class_weights", type=float, nargs='+', default=None,
+        help="Custom weights for each action. Ex: 1.0 1.5 2.0. Auto-fills with 1.0 if not passed."
     )
+    
     parser.add_argument("--save_training_data", action="store_true",
                     help="Save normalized features + observations for visualization")
     parser.add_argument("--use_ica_init", action="store_true", default=True,
                     help="Use ICA initialization for SAE (default: True)")
     parser.add_argument("--no_ica_init", action="store_false", dest="use_ica_init",
                     help="Disable ICA initialization")
-    parser.add_argument("--threshold", type=float, default=0.3,
-                    help="Threshold for rule extraction")
+    
+    # Separated Thresholds
+    parser.add_argument("--threshold", type=float, default=0.5,
+                    help="Probability threshold (p, n) for extracting rules")
+    parser.add_argument("--hard_threshold", type=float, default=0.66,
+                    help="Binarization threshold (Z > hard_threshold) for Hard Logic evaluation")
+    
     args = parser.parse_args()
+    
+    # Pre-flight check
+    if not args.env_name and args.n_actions == -1:
+        print("[Warning] No --env_name provided. Action labels may be incorrect (e.g. 6 actions might be labeled as Pong).")
+        
     main(args)

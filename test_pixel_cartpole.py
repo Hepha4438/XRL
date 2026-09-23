@@ -53,7 +53,7 @@ def evaluate(model: PPO, env, n_episodes: int, max_steps: int, deterministic: bo
 
 def main():
     parser = argparse.ArgumentParser(description="Test PPO PixelCartPole model")
-    parser.add_argument("--model_path", type=str, default="ppo_cartpole_converted.zip")
+    parser.add_argument("--model_path", type=str, default="ppo_pixel_cartpole.zip")
     parser.add_argument("--env_name", type=str, default="PixelCartPole-v0")
     parser.add_argument("--n_episodes", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=500)
