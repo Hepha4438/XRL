@@ -15,7 +15,9 @@ by 255 (policy.normalize_images=True). Calling `features_extractor(obs)` directl
 on the raw uint8 tensor -- as the previous version of this script did -- skips that
 step and yields features from a different distribution than the training data.
 On the first step the script cross-checks this against an explicit `/ 255.0`
-(Method 3 of test_obs_255.py) and aborts if the two disagree.
+(Method 3 of test_obs_255.py) and against the raw uint8 input, using scale-free
+(relative) errors -- GPU convolutions run in TF32 by default, so bit-exact equality
+is not expected -- and aborts only if the features match the wrong scaling.
 
 Environments are built the same way as in feature_collect.py:
   * Atari   : make_atari_env(env_id, n_envs=1, seed) + VecFrameStack(4) + VecTransposeImage
@@ -153,28 +155,53 @@ def extract_features(model, obs):
     return feats, obs_tensor
 
 
+def _rel(a, b):
+    """max|a-b| / max(max|b|, 1e-8): scale-free error (features can be O(10-100))."""
+    return float((a - b).abs().max()) / max(float(b.abs().max()), 1e-8)
+
+
 @torch.no_grad()
-def check_normalization(model, obs, feats, atol=1e-4):
-    """Cross-check SB3 preprocessing against an explicit /255 (test_obs_255.py, Method 3)."""
+def check_normalization(model, obs, feats, rtol=1e-2):
+    """Which input scaling did SB3 actually feed the CNN?  Compares the collected features
+    (Method 2 of test_obs_255.py, = feature_collect.py) with the explicit /255 path (Method 3)
+    and with the raw uint8 path (the old bug). Scale-free (relative) errors are used because
+    on Ampere/Ada GPUs PyTorch runs convolutions in TF32 by default, so two calls of the same
+    CNN can differ by ~1e-3 relative -- an absolute tolerance would give false alarms."""
+    if float(np.max(obs)) == 0.0:
+        print("[check] observation is all zeros (scaling is not identifiable) -> checking at the next step")
+        return False
     obs_space = model.policy.observation_space
     image = is_image_space(obs_space)
     normalize = bool(getattr(model.policy, "normalize_images", True))
-    raw_max = float(np.max(obs))
-    print(f"[check] raw obs max = {raw_max:.1f} | is_image_space = {image} | normalize_images = {normalize}")
-    if not (image and normalize):
-        print("[check] SB3 does not rescale this observation space; features use the raw observation "
-              "(same as the training data from feature_collect.py).")
-        return
-    x = torch.as_tensor(obs).float().to(model.device) / 255.0
-    f3 = model.policy.features_extractor(x)
-    err = float((f3 - feats).abs().max())
-    print(f"[check] max |features(SB3 preprocess) - features(obs/255)| = {err:.2e}")
-    if err > atol:
-        raise RuntimeError("Feature extraction does not match the explicit /255 path -- aborting "
-                           "(held-out features would not be comparable with training features).")
-    raw_feats = model.policy.features_extractor(torch.as_tensor(obs).float().to(model.device))
-    print(f"[check] (for reference) without /255 the features would differ by "
-          f"{float((raw_feats - feats).abs().mean()):.3f} on average -> old bug avoided.")
+    fe = model.policy.features_extractor
+    x_raw = torch.as_tensor(obs).float().to(model.device)
+    f_255 = fe(x_raw / 255.0)
+    f_raw = fe(x_raw)
+    if isinstance(f_255, tuple):
+        f_255, f_raw = f_255[0], f_raw[0]
+    e255, eraw = _rel(feats, f_255), _rel(feats, f_raw)
+    tf32 = torch.backends.cudnn.allow_tf32 and str(model.device).startswith("cuda")
+    print(f"[check] raw obs max = {float(np.max(obs)):.1f} | is_image_space = {image} | "
+          f"normalize_images = {normalize} | cudnn TF32 = {tf32}")
+    print(f"[check] relative error of collected features vs  obs/255 : {e255:.2e}")
+    print(f"[check] relative error of collected features vs  raw obs : {eraw:.2e}")
+
+    expected_255 = image and normalize
+    if expected_255:
+        ok = e255 < rtol and e255 < 0.1 * eraw
+        verdict = "matches obs/255 (numerical noise only)" if ok else "does NOT match obs/255"
+    else:
+        ok = eraw < rtol and eraw < 0.1 * max(e255, 1e-12)
+        verdict = ("SB3 does not rescale this space; matches the raw observation "
+                   "(same convention as feature_collect.py)" if ok else "does NOT match the raw observation")
+    print(f"[check] -> {verdict}")
+    if not ok:
+        raise RuntimeError(
+            "Collected features do not match the input scaling SB3 is supposed to apply "
+            f"(expected {'obs/255' if expected_255 else 'raw obs'}; rel. err /255={e255:.2e}, raw={eraw:.2e}). "
+            "Held-out features would not be comparable with the training features. "
+            "Re-run with --skip_norm_check only if you understand why.")
+    return True
 
 
 # ============================================================================
@@ -215,7 +242,7 @@ def grab_observations(kind, vec_env, raw_env, obs, mode, tile_size):
 # ============================================================================
 
 def collect_with_observations(model_path, env_name, n_episodes=800, seed=42, tile_size=8,
-                              save_obs_mode="auto", max_total_steps=0, device="auto"):
+                              save_obs_mode="auto", max_total_steps=0, device="auto", skip_norm_check=False):
     env_name = canonical_env_name(env_name)
     kind = env_kind(env_name)
     if save_obs_mode == "auto":
@@ -250,8 +277,11 @@ def collect_with_observations(model_path, env_name, n_episodes=800, seed=42, til
         action, _ = model.predict(obs, deterministic=True)
         feats, _ = extract_features(model, obs)
         if not checked:
-            check_normalization(model, obs, feats)
-            checked = True
+            if skip_norm_check:
+                print("[check] skipped (--skip_norm_check)")
+                checked = True
+            else:
+                checked = check_normalization(model, obs, feats)
 
         feats_l.append(feats.float().cpu())
         acts_l.append(torch.as_tensor(action).long().view(-1))
@@ -325,11 +355,14 @@ def main():
                          "Atari RGB frames (pixel/both) cost ~100 KB/step.")
     ap.add_argument("--max_total_steps", type=int, default=0, help="Safety cap on total steps (0 = none)")
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--skip_norm_check", action="store_true",
+                    help="Skip the first-step /255 consistency check (not recommended)")
     ap.add_argument("--save_path", type=str, default="./stage1_outputs/collected_data_with_obs.pt")
     args = ap.parse_args()
 
     data = collect_with_observations(args.model_path, args.env_name, args.n_episodes, args.seed,
-                                     args.tile_size, args.save_obs_mode, args.max_total_steps, args.device)
+                                     args.tile_size, args.save_obs_mode, args.max_total_steps, args.device,
+                                     args.skip_norm_check)
     d = os.path.dirname(args.save_path)
     if d:
         os.makedirs(d, exist_ok=True)
